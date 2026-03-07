@@ -9,7 +9,7 @@ import secrets
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -371,6 +371,474 @@ def match_rank(match_type: str) -> int:
     return order.get(match_type, 99)
 
 
+TASK_SEARCH_FIELDS = ("title", "content", "desc", "subtask", "tag", "project")
+
+
+def parse_json_document(raw_text: str | None, file_path: str | None) -> Any:
+    if raw_text and file_path:
+        raise CliError("Pass only one of --json or --json-file.")
+    if not raw_text and not file_path:
+        raise CliError("Pass --json or --json-file.")
+    if file_path:
+        try:
+            raw_text = Path(file_path).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise CliError(f"Cannot read {file_path}: {exc}") from exc
+    try:
+        return json.loads(raw_text or "")
+    except json.JSONDecodeError as exc:
+        raise CliError(f"Invalid JSON input: {exc}") from exc
+
+
+def parse_ticktick_datetime(raw_value: str | None) -> datetime | None:
+    if not raw_value or not isinstance(raw_value, str):
+        return None
+    text = raw_value.strip()
+    if not text:
+        return None
+
+    formats = (
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+    )
+    candidates = [text]
+    if text.endswith("Z"):
+        candidates.append(text[:-1] + "+0000")
+        candidates.append(text[:-1] + "+00:00")
+
+    for candidate in candidates:
+        for fmt in formats:
+            try:
+                parsed = datetime.strptime(candidate, fmt)
+                if fmt == "%Y-%m-%d":
+                    return parsed.replace(tzinfo=timezone.utc)
+                return parsed
+            except ValueError:
+                continue
+        try:
+            return datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+    if len(text) >= 10:
+        try:
+            parsed_date = datetime.strptime(text[:10], "%Y-%m-%d")
+            return parsed_date.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def task_priority_value(task: dict[str, Any]) -> int:
+    value = task.get("priority")
+    return int(value) if isinstance(value, int) else 0
+
+
+def task_sort_key(task: dict[str, Any]) -> tuple[Any, ...]:
+    due_value = str(task.get("dueDate") or "")
+    return (due_value == "", due_value, -task_priority_value(task), str(task.get("title", "")).casefold())
+
+
+def is_task_all_day(task: dict[str, Any]) -> bool:
+    return bool(task.get("isAllDay"))
+
+
+def is_task_overdue(task: dict[str, Any], reference: datetime | None = None) -> bool:
+    reference_time = reference or now_utc()
+    due_raw = str(task.get("dueDate") or "")
+    due_time = parse_ticktick_datetime(due_raw)
+    if due_time is None:
+        return False
+    if is_task_all_day(task) or len(due_raw) <= 10:
+        return due_time.date() < reference_time.date()
+    if due_time.tzinfo is None:
+        return due_time < reference_time.replace(tzinfo=None)
+    return due_time.astimezone(timezone.utc) < reference_time
+
+
+def is_task_due_in_days(task: dict[str, Any], days: int, reference: datetime | None = None) -> bool:
+    reference_time = reference or now_utc()
+    due_time = parse_ticktick_datetime(str(task.get("dueDate") or ""))
+    if due_time is None:
+        return False
+    return due_time.date() == (reference_time + timedelta(days=days)).date()
+
+
+def is_task_due_within_days(task: dict[str, Any], days: int, reference: datetime | None = None) -> bool:
+    reference_time = reference or now_utc()
+    due_time = parse_ticktick_datetime(str(task.get("dueDate") or ""))
+    if due_time is None:
+        return False
+    due_date = due_time.date()
+    start_date = reference_time.date()
+    end_date = (reference_time + timedelta(days=days)).date()
+    return start_date <= due_date <= end_date
+
+
+def list_projects(
+    args: argparse.Namespace,
+    region: RegionConfig,
+    token_path: Path,
+    include_closed_projects: bool = False,
+) -> list[dict[str, Any]]:
+    response = api_request(args, region, token_path, "GET", "/project")
+    projects = response if isinstance(response, list) else []
+    result: list[dict[str, Any]] = []
+    for project in projects:
+        if not isinstance(project, dict):
+            continue
+        if project.get("closed") and not include_closed_projects:
+            continue
+        result.append(project)
+    return result
+
+
+def summarize_project(project: dict[str, Any]) -> str:
+    return str(project.get("name") or project.get("id") or "<unknown project>")
+
+
+def summarize_task(task: dict[str, Any]) -> str:
+    title = str(task.get("title") or task.get("id") or "<unknown task>")
+    project_name = str(task.get("projectName") or "")
+    return f"{title} @ {project_name}" if project_name else title
+
+
+def summarize_subtask(item: dict[str, Any]) -> str:
+    title = str(item.get("title") or item.get("id") or "<unknown subtask>")
+    parent_title = str(item.get("parentTaskTitle") or "")
+    return f"{title} under {parent_title}" if parent_title else title
+
+
+def summarize_matches(matches: list[dict[str, Any]], summarize) -> str:
+    preview = ", ".join(summarize(item) for item in matches[:5])
+    if len(matches) > 5:
+        preview += ", ..."
+    return preview
+
+
+def choose_single_match(
+    matches: list[dict[str, Any]],
+    query: str,
+    kind: str,
+    summarize,
+) -> dict[str, Any]:
+    if not matches:
+        raise CliError(f"No {kind} match found for '{query}'.")
+    if len(matches) == 1:
+        return matches[0]
+
+    exact_matches = [item for item in matches if str(item.get("matchType", "")) == "exact"]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+
+    first_rank = match_rank(str(matches[0].get("matchType", "")))
+    second_rank = match_rank(str(matches[1].get("matchType", "")))
+    if first_rank < second_rank:
+        return matches[0]
+
+    raise CliError(f"Ambiguous {kind} match for '{query}': {summarize_matches(matches, summarize)}")
+
+
+def find_project_matches(projects: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    for project in projects:
+        name = str(project.get("name", ""))
+        match_type = classify_match(query, name)
+        if match_type is None:
+            continue
+        project_copy = dict(project)
+        project_copy["matchType"] = match_type
+        matches.append(project_copy)
+    matches.sort(key=lambda item: (match_rank(str(item.get("matchType", ""))), str(item.get("name", "")).casefold()))
+    return matches
+
+
+def resolve_project_selection(
+    args: argparse.Namespace,
+    region: RegionConfig,
+    token_path: Path,
+    project_id: str | None = None,
+    project_name: str | None = None,
+    include_closed_projects: bool = False,
+) -> tuple[str | None, str | None]:
+    if project_id:
+        project_lookup = list_projects(args, region, token_path, include_closed_projects=True)
+        for project in project_lookup:
+            if str(project.get("id", "")) == project_id:
+                return project_id, str(project.get("name", ""))
+        return project_id, None
+
+    if not project_name:
+        return None, None
+
+    projects = list_projects(
+        args,
+        region,
+        token_path,
+        include_closed_projects=include_closed_projects,
+    )
+    matches = find_project_matches(projects, project_name)
+    match = choose_single_match(matches, project_name, "project", summarize_project)
+    return str(match.get("id") or ""), str(match.get("name") or "")
+
+
+def collect_tasks(
+    args: argparse.Namespace,
+    region: RegionConfig,
+    token_path: Path,
+    project_id: str | None = None,
+    project_name: str | None = None,
+    include_completed: bool = False,
+    include_closed_projects: bool = False,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    selected_project: dict[str, Any] | None = None
+    target_projects: list[dict[str, Any]] = []
+
+    if project_id or project_name:
+        resolved_project_id, resolved_project_name = resolve_project_selection(
+            args,
+            region,
+            token_path,
+            project_id=project_id,
+            project_name=project_name,
+            include_closed_projects=include_closed_projects,
+        )
+        if not resolved_project_id:
+            return None, []
+        selected_project = {"id": resolved_project_id, "name": resolved_project_name or ""}
+        target_projects = [selected_project]
+    else:
+        target_projects = list_projects(
+            args,
+            region,
+            token_path,
+            include_closed_projects=include_closed_projects,
+        )
+
+    tasks: list[dict[str, Any]] = []
+    for project in target_projects:
+        project_id_value = project.get("id")
+        if not isinstance(project_id_value, str) or not project_id_value:
+            continue
+        data = api_request(args, region, token_path, "GET", f"/project/{project_id_value}/data")
+        if not isinstance(data, dict):
+            continue
+
+        project_doc = data.get("project")
+        if selected_project and isinstance(project_doc, dict):
+            selected_project = dict(project_doc)
+
+        project_name_value = str(project_doc.get("name", "")) if isinstance(project_doc, dict) else str(project.get("name", ""))
+        for task in data.get("tasks", []):
+            if not isinstance(task, dict):
+                continue
+            if task.get("status") == 2 and not include_completed:
+                continue
+            task_copy = dict(task)
+            task_copy["projectName"] = project_name_value
+            tasks.append(task_copy)
+
+    tasks.sort(key=task_sort_key)
+    return selected_project, tasks
+
+
+def build_task_search_result(
+    query: str,
+    task: dict[str, Any],
+    search_fields: tuple[str, ...],
+) -> dict[str, Any] | None:
+    matched_fields: list[dict[str, str]] = []
+
+    def consider(field_name: str, candidate: str | None) -> None:
+        match_type = classify_match(query, candidate)
+        if match_type is None:
+            return
+        matched_fields.append({"field": field_name, "matchType": match_type})
+
+    if "title" in search_fields:
+        consider("title", str(task.get("title", "")))
+    if "content" in search_fields:
+        consider("content", str(task.get("content", "")))
+    if "desc" in search_fields:
+        consider("desc", str(task.get("desc", "")))
+    if "project" in search_fields:
+        consider("project", str(task.get("projectName", "")))
+    if "tag" in search_fields:
+        for tag in task.get("tags", []):
+            if isinstance(tag, str):
+                consider("tag", tag)
+    if "subtask" in search_fields:
+        items = task.get("items") if isinstance(task.get("items"), list) else []
+        for item in items:
+            if isinstance(item, dict):
+                consider("subtask", str(item.get("title", "")))
+
+    if not matched_fields:
+        return None
+
+    best_match = min(matched_fields, key=lambda item: match_rank(item["matchType"]))
+    task_copy = dict(task)
+    task_copy["matchType"] = best_match["matchType"]
+    task_copy["matchedFields"] = matched_fields
+    return task_copy
+
+
+def search_tasks_in_collection(
+    query: str,
+    tasks: list[dict[str, Any]],
+    search_fields: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    for task in tasks:
+        result = build_task_search_result(query, task, search_fields)
+        if result is not None:
+            matches.append(result)
+
+    matches.sort(key=lambda item: (
+        match_rank(str(item.get("matchType", ""))),
+        str(item.get("projectName", "")).casefold(),
+        str(item.get("title", "")).casefold(),
+    ))
+    return matches
+
+
+def resolve_task_selection(
+    args: argparse.Namespace,
+    region: RegionConfig,
+    token_path: Path,
+    task_title: str,
+    project_id: str | None = None,
+    project_name: str | None = None,
+    include_completed: bool = False,
+    include_closed_projects: bool = False,
+) -> dict[str, Any]:
+    _, tasks = collect_tasks(
+        args,
+        region,
+        token_path,
+        project_id=project_id,
+        project_name=project_name,
+        include_completed=include_completed,
+        include_closed_projects=include_closed_projects,
+    )
+    matches = search_tasks_in_collection(task_title, tasks, ("title",))
+    return choose_single_match(matches, task_title, "task", summarize_task)
+
+
+def search_subtasks_in_task(query: str, task: dict[str, Any]) -> list[dict[str, Any]]:
+    items = task.get("items") if isinstance(task.get("items"), list) else []
+    matches: list[dict[str, Any]] = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        match_type = classify_match(query, str(item.get("title", "")))
+        if match_type is None:
+            continue
+        item_copy = dict(item)
+        item_copy["matchType"] = match_type
+        item_copy["parentTaskId"] = task.get("id")
+        item_copy["parentTaskTitle"] = task.get("title")
+        item_copy["projectId"] = task.get("projectId")
+        item_copy["projectName"] = task.get("projectName", "")
+        matches.append(item_copy)
+
+    matches.sort(key=lambda item: (
+        match_rank(str(item.get("matchType", ""))),
+        str(item.get("title", "")).casefold(),
+    ))
+    return matches
+
+
+def find_existing_subtask_item(items: list[dict[str, Any]], match: dict[str, Any]) -> dict[str, Any] | None:
+    match_id = str(match.get("id") or "")
+    if match_id:
+        for item in items:
+            if str(item.get("id", "")) == match_id:
+                return item
+
+    match_title = str(match.get("title") or "")
+    for item in items:
+        if str(item.get("title", "")) == match_title:
+            return item
+    return None
+
+
+def resolve_parent_task(
+    args: argparse.Namespace,
+    region: RegionConfig,
+    token_path: Path,
+    project_id: str | None = None,
+    project_name: str | None = None,
+    task_id: str | None = None,
+    parent_task_title: str | None = None,
+    include_completed: bool = False,
+    include_closed_projects: bool = False,
+) -> dict[str, Any]:
+    resolved_project_id, resolved_project_name = resolve_project_selection(
+        args,
+        region,
+        token_path,
+        project_id=project_id,
+        project_name=project_name,
+        include_closed_projects=include_closed_projects,
+    )
+
+    if task_id:
+        if not resolved_project_id:
+            raise CliError("Provide --project-id or --project-name when using --task-id.")
+        task = fetch_task(args, region, token_path, resolved_project_id, task_id)
+        task["projectName"] = resolved_project_name or task.get("projectName") or ""
+        return task
+
+    if not parent_task_title:
+        raise CliError("Provide --task-id with project context or --parent-task-title.")
+
+    match = resolve_task_selection(
+        args,
+        region,
+        token_path,
+        parent_task_title,
+        project_id=resolved_project_id,
+        project_name=resolved_project_name,
+        include_completed=include_completed,
+        include_closed_projects=include_closed_projects,
+    )
+    task = fetch_task(args, region, token_path, str(match.get("projectId")), str(match.get("id")))
+    task["projectName"] = str(match.get("projectName", ""))
+    return task
+
+
+def resolve_subtask_selection(
+    args: argparse.Namespace,
+    region: RegionConfig,
+    token_path: Path,
+    subtask_title: str,
+    project_id: str | None = None,
+    project_name: str | None = None,
+    task_id: str | None = None,
+    parent_task_title: str | None = None,
+    include_completed: bool = False,
+    include_closed_projects: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    parent_task = resolve_parent_task(
+        args,
+        region,
+        token_path,
+        project_id=project_id,
+        project_name=project_name,
+        task_id=task_id,
+        parent_task_title=parent_task_title,
+        include_completed=include_completed,
+        include_closed_projects=include_closed_projects,
+    )
+    matches = search_subtasks_in_task(subtask_title, parent_task)
+    match = choose_single_match(matches, subtask_title, "subtask", summarize_subtask)
+    return parent_task, match
+
+
 def fetch_task(args: argparse.Namespace, region: RegionConfig, token_path: Path, project_id: str, task_id: str) -> dict[str, Any]:
     response = api_request(args, region, token_path, "GET", f"/project/{project_id}/task/{task_id}")
     if not isinstance(response, dict):
@@ -616,47 +1084,24 @@ def command_project_delete(args: argparse.Namespace, region: RegionConfig, token
 
 
 def command_tasks(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
-    if args.project_id:
-        response = api_request(args, region, token_path, "GET", f"/project/{args.project_id}/data")
-        project = response.get("project") if isinstance(response, dict) else None
-        tasks = response.get("tasks", []) if isinstance(response, dict) else []
-    else:
-        projects_response = api_request(args, region, token_path, "GET", "/project")
-        projects = projects_response if isinstance(projects_response, list) else []
-        project = None
-        tasks = []
-        for item in projects:
-            if not isinstance(item, dict):
-                continue
-            project_id = item.get("id")
-            if not isinstance(project_id, str) or not project_id:
-                continue
-            if item.get("closed") and not args.include_closed_projects:
-                continue
-            data = api_request(args, region, token_path, "GET", f"/project/{project_id}/data")
-            if isinstance(data, dict):
-                for task in data.get("tasks", []):
-                    if isinstance(task, dict):
-                        tasks.append(task)
-
-    filtered: list[dict[str, Any]] = []
-    for task in tasks:
-        if not isinstance(task, dict):
-            continue
-        status = task.get("status")
-        if not args.include_completed and status == 2:
-            continue
-        filtered.append(task)
-
+    project, tasks = collect_tasks(
+        args,
+        region,
+        token_path,
+        project_id=args.project_id,
+        project_name=getattr(args, "project_name", None),
+        include_completed=args.include_completed,
+        include_closed_projects=args.include_closed_projects,
+    )
     if args.limit and args.limit > 0:
-        filtered = filtered[: args.limit]
+        tasks = tasks[: args.limit]
 
     emit(
         {
             "ok": True,
             "project": project,
-            "count": len(filtered),
-            "tasks": filtered,
+            "count": len(tasks),
+            "tasks": tasks,
         }
     )
 
@@ -711,9 +1156,24 @@ def build_task_payload(args: argparse.Namespace, include_identity: bool) -> dict
 
 
 def command_task_create(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    project_id, project_name = resolve_project_selection(
+        args,
+        region,
+        token_path,
+        project_id=args.project_id,
+        project_name=getattr(args, "project_name", None),
+    )
     payload = build_task_payload(args, include_identity=False)
+    payload["projectId"] = project_id or "inbox"
     task = api_request(args, region, token_path, "POST", "/task", json_body=payload)
-    emit({"ok": True, "task": task})
+    emit(
+        {
+            "ok": True,
+            "task": task,
+            "resolved_project_id": payload["projectId"],
+            "resolved_project_name": project_name or ("Inbox" if payload["projectId"] == "inbox" else None),
+        }
+    )
 
 
 def command_task_update(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
@@ -755,50 +1215,330 @@ def command_task_get(args: argparse.Namespace, region: RegionConfig, token_path:
 
 
 def command_task_find(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
-    project_map: dict[str, str] = {}
-    projects_response = api_request(args, region, token_path, "GET", "/project")
-    projects = projects_response if isinstance(projects_response, list) else []
-    project_ids: list[str] = []
-
-    for project in projects:
-        if not isinstance(project, dict):
-            continue
-        project_id = project.get("id")
-        if not isinstance(project_id, str) or not project_id:
-            continue
-        project_map[project_id] = str(project.get("name", ""))
-        if project.get("closed") and not args.include_closed_projects:
-            continue
-        if args.project_id and project_id != args.project_id:
-            continue
-        project_ids.append(project_id)
-
-    matches: list[dict[str, Any]] = []
-    for project_id in project_ids:
-        data = api_request(args, region, token_path, "GET", f"/project/{project_id}/data")
-        tasks = data.get("tasks", []) if isinstance(data, dict) else []
-        for task in tasks:
-            if not isinstance(task, dict):
-                continue
-            if task.get("status") == 2 and not args.include_completed:
-                continue
-            title = str(task.get("title", ""))
-            match_type = classify_match(args.title, title)
-            if match_type is None:
-                continue
-            task_copy = dict(task)
-            task_copy["matchType"] = match_type
-            task_copy["projectName"] = project_map.get(project_id, "")
-            matches.append(task_copy)
-
-    matches.sort(key=lambda item: (
-        match_rank(str(item.get("matchType", ""))),
-        str(item.get("projectName", "")).casefold(),
-        str(item.get("title", "")).casefold(),
-    ))
+    _, tasks = collect_tasks(
+        args,
+        region,
+        token_path,
+        project_id=args.project_id,
+        project_name=getattr(args, "project_name", None),
+        include_completed=args.include_completed,
+        include_closed_projects=args.include_closed_projects,
+    )
+    matches = search_tasks_in_collection(args.title, tasks, ("title",))
     if args.limit and args.limit > 0:
         matches = matches[: args.limit]
     emit({"ok": True, "query": args.title, "count": len(matches), "tasks": matches})
+
+
+def command_task_search(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    _, tasks = collect_tasks(
+        args,
+        region,
+        token_path,
+        project_id=args.project_id,
+        project_name=getattr(args, "project_name", None),
+        include_completed=args.include_completed,
+        include_closed_projects=args.include_closed_projects,
+    )
+    search_fields = tuple(args.field) if args.field else TASK_SEARCH_FIELDS
+    matches = search_tasks_in_collection(args.query, tasks, search_fields)
+    if args.limit and args.limit > 0:
+        matches = matches[: args.limit]
+    emit({"ok": True, "query": args.query, "fields": list(search_fields), "count": len(matches), "tasks": matches})
+
+
+def command_task_smart_update(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    match = resolve_task_selection(
+        args,
+        region,
+        token_path,
+        args.task_title,
+        project_id=args.project_id,
+        project_name=args.project_name,
+        include_completed=args.include_completed,
+        include_closed_projects=args.include_closed_projects,
+    )
+    update_args = argparse.Namespace(
+        task_id=str(match.get("id")),
+        project_id=str(match.get("projectId")),
+        title=args.title,
+        content=args.content,
+        desc=args.desc,
+        priority=args.priority,
+        due_date=args.due_date,
+        start_date=args.start_date,
+        time_zone=args.time_zone,
+        all_day=args.all_day,
+        tags=args.tags,
+        repeat_flag=args.repeat_flag,
+        reminders=args.reminders,
+        subtask=None,
+        clear_due_date=args.clear_due_date,
+        clear_start_date=args.clear_start_date,
+    )
+    payload = build_task_payload(update_args, include_identity=True)
+    if len(payload.keys()) <= 2:
+        raise CliError("No update fields provided.")
+    task = api_request(args, region, token_path, "POST", f"/task/{match['id']}", json_body=payload)
+    emit({
+        "ok": True,
+        "matched_task": {
+            "id": match.get("id"),
+            "projectId": match.get("projectId"),
+            "title": match.get("title"),
+            "projectName": match.get("projectName"),
+        },
+        "task": task,
+    })
+
+
+def command_task_smart_complete(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    match = resolve_task_selection(
+        args,
+        region,
+        token_path,
+        args.task_title,
+        project_id=args.project_id,
+        project_name=args.project_name,
+        include_completed=args.include_completed,
+        include_closed_projects=args.include_closed_projects,
+    )
+    api_request(
+        args,
+        region,
+        token_path,
+        "POST",
+        f"/project/{match['projectId']}/task/{match['id']}/complete",
+        expected_statuses=(200, 201),
+    )
+    emit({
+        "ok": True,
+        "matched_task": {
+            "id": match.get("id"),
+            "projectId": match.get("projectId"),
+            "title": match.get("title"),
+            "projectName": match.get("projectName"),
+        },
+        "completed_task_id": match.get("id"),
+        "project_id": match.get("projectId"),
+    })
+
+
+def command_task_smart_delete(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    match = resolve_task_selection(
+        args,
+        region,
+        token_path,
+        args.task_title,
+        project_id=args.project_id,
+        project_name=args.project_name,
+        include_completed=args.include_completed,
+        include_closed_projects=args.include_closed_projects,
+    )
+    api_request(
+        args,
+        region,
+        token_path,
+        "DELETE",
+        f"/project/{match['projectId']}/task/{match['id']}",
+        expected_statuses=(200, 201),
+    )
+    emit({
+        "ok": True,
+        "matched_task": {
+            "id": match.get("id"),
+            "projectId": match.get("projectId"),
+            "title": match.get("title"),
+            "projectName": match.get("projectName"),
+        },
+        "deleted_task_id": match.get("id"),
+        "project_id": match.get("projectId"),
+    })
+
+
+def command_tasks_due(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    if args.days is not None and args.days < 0:
+        raise CliError("--days must be 0 or greater.")
+
+    project, tasks = collect_tasks(
+        args,
+        region,
+        token_path,
+        project_id=args.project_id,
+        project_name=getattr(args, "project_name", None),
+        include_completed=False,
+        include_closed_projects=args.include_closed_projects,
+    )
+    reference_time = now_utc()
+
+    if args.days is not None:
+        mode = f"in-{args.days}-days"
+        filtered = [task for task in tasks if is_task_due_in_days(task, args.days, reference_time)]
+    elif args.when == "today":
+        mode = "today"
+        filtered = [task for task in tasks if is_task_due_in_days(task, 0, reference_time)]
+    elif args.when == "tomorrow":
+        mode = "tomorrow"
+        filtered = [task for task in tasks if is_task_due_in_days(task, 1, reference_time)]
+    elif args.when == "this-week":
+        mode = "this-week"
+        filtered = [task for task in tasks if is_task_due_within_days(task, 7, reference_time)]
+    elif args.when == "overdue":
+        mode = "overdue"
+        filtered = [task for task in tasks if is_task_overdue(task, reference_time)]
+    else:
+        raise CliError("Provide --when or --days.")
+
+    filtered.sort(key=task_sort_key)
+    if args.limit and args.limit > 0:
+        filtered = filtered[: args.limit]
+    emit({"ok": True, "project": project, "mode": mode, "count": len(filtered), "tasks": filtered})
+
+
+def command_tasks_focus(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    project, tasks = collect_tasks(
+        args,
+        region,
+        token_path,
+        project_id=args.project_id,
+        project_name=getattr(args, "project_name", None),
+        include_completed=False,
+        include_closed_projects=args.include_closed_projects,
+    )
+    reference_time = now_utc()
+
+    if args.mode == "engaged":
+        filtered = [
+            task for task in tasks
+            if task_priority_value(task) == 5 or is_task_due_in_days(task, 0, reference_time) or is_task_overdue(task, reference_time)
+        ]
+    elif args.mode == "next":
+        filtered = [
+            task for task in tasks
+            if task_priority_value(task) == 3 or is_task_due_in_days(task, 1, reference_time)
+        ]
+    else:
+        raise CliError("Invalid focus mode.")
+
+    filtered.sort(key=lambda task: (-task_priority_value(task),) + task_sort_key(task))
+    if args.limit and args.limit > 0:
+        filtered = filtered[: args.limit]
+    emit({"ok": True, "project": project, "mode": args.mode, "count": len(filtered), "tasks": filtered})
+
+
+def command_tasks_batch_create(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    document = parse_json_document(args.json, args.json_file)
+    if not isinstance(document, list):
+        raise CliError("Batch input must be a JSON array of task objects.")
+
+    created: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    project_cache: dict[str, tuple[str | None, str | None]] = {}
+
+    for index, item in enumerate(document, start=1):
+        if not isinstance(item, dict):
+            failed.append({"index": index, "error": "Each batch item must be a JSON object."})
+            continue
+
+        title = str(item.get("title") or "").strip()
+        if not title:
+            failed.append({"index": index, "error": "Missing required field 'title'."})
+            continue
+
+        project_id_value = item.get("projectId") or item.get("project_id")
+        project_name_value = item.get("projectName") or item.get("project_name")
+
+        try:
+            resolved_project_id: str | None = str(project_id_value).strip() if isinstance(project_id_value, str) and project_id_value.strip() else None
+            resolved_project_name: str | None = None
+            if isinstance(project_name_value, str) and project_name_value.strip():
+                cache_key = project_name_value.strip().casefold()
+                if cache_key not in project_cache:
+                    project_cache[cache_key] = resolve_project_selection(
+                        args,
+                        region,
+                        token_path,
+                        project_id=resolved_project_id,
+                        project_name=project_name_value.strip(),
+                    )
+                resolved_project_id, resolved_project_name = project_cache[cache_key]
+            elif resolved_project_id:
+                resolved_project_id, resolved_project_name = resolve_project_selection(
+                    args,
+                    region,
+                    token_path,
+                    project_id=resolved_project_id,
+                )
+
+            payload: dict[str, Any] = {
+                "title": title,
+                "projectId": resolved_project_id or "inbox",
+            }
+            for input_key, output_key in (
+                ("content", "content"),
+                ("desc", "desc"),
+                ("dueDate", "dueDate"),
+                ("due_date", "dueDate"),
+                ("startDate", "startDate"),
+                ("start_date", "startDate"),
+                ("timeZone", "timeZone"),
+                ("time_zone", "timeZone"),
+                ("repeatFlag", "repeatFlag"),
+                ("repeat_flag", "repeatFlag"),
+            ):
+                value = item.get(input_key)
+                if value is not None:
+                    payload[output_key] = value
+
+            priority = item.get("priority")
+            if priority is not None:
+                payload["priority"] = priority
+
+            all_day = item.get("isAllDay")
+            if all_day is None:
+                all_day = item.get("allDay")
+            if all_day is None:
+                all_day = item.get("all_day")
+            if all_day:
+                payload["isAllDay"] = True
+
+            tags = item.get("tags")
+            if isinstance(tags, str):
+                payload["tags"] = [tag.strip() for tag in tags.split(",") if tag.strip()]
+            elif isinstance(tags, list):
+                payload["tags"] = [str(tag).strip() for tag in tags if str(tag).strip()]
+
+            reminders = item.get("reminders")
+            if isinstance(reminders, str):
+                payload["reminders"] = [value.strip() for value in reminders.split(",") if value.strip()]
+            elif isinstance(reminders, list):
+                payload["reminders"] = [str(value).strip() for value in reminders if str(value).strip()]
+
+            items_value = item.get("items")
+            subtasks = item.get("subtasks")
+            if isinstance(items_value, list):
+                payload["items"] = [subtask for subtask in items_value if isinstance(subtask, dict)]
+            elif isinstance(subtasks, list):
+                payload["items"] = [{"title": str(value).strip()} for value in subtasks if str(value).strip()]
+
+            task = api_request(args, region, token_path, "POST", "/task", json_body=payload)
+            created.append({
+                "index": index,
+                "title": title,
+                "projectId": payload["projectId"],
+                "projectName": resolved_project_name or ("Inbox" if payload["projectId"] == "inbox" else None),
+                "task": task,
+            })
+        except CliError as exc:
+            failed.append({"index": index, "title": title, "error": str(exc)})
+
+    emit({
+        "ok": len(failed) == 0,
+        "createdCount": len(created),
+        "failedCount": len(failed),
+        "created": created,
+        "failed": failed,
+    })
 
 
 def command_task_move(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
@@ -817,8 +1557,13 @@ def command_task_move(args: argparse.Namespace, region: RegionConfig, token_path
 
 def command_tasks_completed(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
     payload: dict[str, Any] = {}
-    if args.project_id:
-        payload["projectIds"] = args.project_id
+    project_ids = list(args.project_id or [])
+    if getattr(args, "project_name", None):
+        resolved_project_id, _ = resolve_project_selection(args, region, token_path, project_name=args.project_name)
+        if resolved_project_id:
+            project_ids.append(resolved_project_id)
+    if project_ids:
+        payload["projectIds"] = project_ids
     if args.start_date:
         payload["startDate"] = args.start_date
     if args.end_date:
@@ -831,8 +1576,13 @@ def command_tasks_completed(args: argparse.Namespace, region: RegionConfig, toke
 
 def command_tasks_filter(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
     payload: dict[str, Any] = {}
-    if args.project_id:
-        payload["projectIds"] = args.project_id
+    project_ids = list(args.project_id or [])
+    if getattr(args, "project_name", None):
+        resolved_project_id, _ = resolve_project_selection(args, region, token_path, project_name=args.project_name)
+        if resolved_project_id:
+            project_ids.append(resolved_project_id)
+    if project_ids:
+        payload["projectIds"] = project_ids
     if args.start_date:
         payload["startDate"] = args.start_date
     if args.end_date:
@@ -943,6 +1693,200 @@ def command_subtask_delete(args: argparse.Namespace, region: RegionConfig, token
     emit({"ok": True, "task": updated, "deleted_subtask_id": args.subtask_id})
 
 
+def command_subtask_find(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    parent_task = resolve_parent_task(
+        args,
+        region,
+        token_path,
+        project_id=args.project_id,
+        project_name=args.project_name,
+        task_id=args.task_id,
+        parent_task_title=args.parent_task_title,
+        include_completed=args.include_completed,
+        include_closed_projects=args.include_closed_projects,
+    )
+    matches = search_subtasks_in_task(args.subtask_title, parent_task)
+    if args.limit and args.limit > 0:
+        matches = matches[: args.limit]
+    emit({
+        "ok": True,
+        "query": args.subtask_title,
+        "parentTask": {
+            "id": parent_task.get("id"),
+            "projectId": parent_task.get("projectId"),
+            "title": parent_task.get("title"),
+            "projectName": parent_task.get("projectName"),
+        },
+        "count": len(matches),
+        "subtasks": matches,
+    })
+
+
+def command_subtask_smart_add(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    parent_task = resolve_parent_task(
+        args,
+        region,
+        token_path,
+        project_id=args.project_id,
+        project_name=args.project_name,
+        task_id=args.task_id,
+        parent_task_title=args.parent_task_title,
+        include_completed=args.include_completed,
+        include_closed_projects=args.include_closed_projects,
+    )
+    existing_items = parent_task.get("items") if isinstance(parent_task.get("items"), list) else []
+    items = [clean_subtask_item(item) for item in existing_items if isinstance(item, dict)]
+
+    new_item: dict[str, Any] = {"title": args.title}
+    if args.start_date:
+        new_item["startDate"] = args.start_date
+    if args.time_zone:
+        new_item["timeZone"] = args.time_zone
+    if args.sort_order is not None:
+        new_item["sortOrder"] = args.sort_order
+    if args.all_day:
+        new_item["isAllDay"] = True
+
+    items.append(new_item)
+    updated = update_task_items(args, region, token_path, str(parent_task.get("projectId")), str(parent_task.get("id")), items)
+    updated_items = updated.get("items") if isinstance(updated.get("items"), list) else []
+    emit({
+        "ok": True,
+        "parentTask": {
+            "id": parent_task.get("id"),
+            "projectId": parent_task.get("projectId"),
+            "title": parent_task.get("title"),
+            "projectName": parent_task.get("projectName"),
+        },
+        "task": updated,
+        "subtask_count": len(updated_items),
+    })
+
+
+def command_subtask_smart_update(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    parent_task, match = resolve_subtask_selection(
+        args,
+        region,
+        token_path,
+        args.subtask_title,
+        project_id=args.project_id,
+        project_name=args.project_name,
+        task_id=args.task_id,
+        parent_task_title=args.parent_task_title,
+        include_completed=args.include_completed,
+        include_closed_projects=args.include_closed_projects,
+    )
+    existing_items = parent_task.get("items") if isinstance(parent_task.get("items"), list) else []
+    items = [clean_subtask_item(item) for item in existing_items if isinstance(item, dict)]
+    target = find_existing_subtask_item(items, match)
+    if target is None:
+        raise CliError(f"Subtask {args.subtask_title} not found in task {parent_task.get('id')}.")
+
+    changed = False
+    if args.new_title:
+        target["title"] = args.new_title
+        changed = True
+    if args.start_date is not None:
+        target["startDate"] = args.start_date
+        changed = True
+    if args.time_zone is not None:
+        target["timeZone"] = args.time_zone
+        changed = True
+    if args.sort_order is not None:
+        target["sortOrder"] = args.sort_order
+        changed = True
+    if args.all_day:
+        target["isAllDay"] = True
+        changed = True
+
+    if not changed:
+        raise CliError("No subtask update fields provided.")
+
+    updated = update_task_items(args, region, token_path, str(parent_task.get("projectId")), str(parent_task.get("id")), items)
+    emit({
+        "ok": True,
+        "parentTask": {
+            "id": parent_task.get("id"),
+            "projectId": parent_task.get("projectId"),
+            "title": parent_task.get("title"),
+            "projectName": parent_task.get("projectName"),
+        },
+        "matchedSubtask": match,
+        "task": updated,
+    })
+
+
+def command_subtask_smart_complete(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    parent_task, match = resolve_subtask_selection(
+        args,
+        region,
+        token_path,
+        args.subtask_title,
+        project_id=args.project_id,
+        project_name=args.project_name,
+        task_id=args.task_id,
+        parent_task_title=args.parent_task_title,
+        include_completed=args.include_completed,
+        include_closed_projects=args.include_closed_projects,
+    )
+    existing_items = parent_task.get("items") if isinstance(parent_task.get("items"), list) else []
+    items = [clean_subtask_item(item) for item in existing_items if isinstance(item, dict)]
+    target = find_existing_subtask_item(items, match)
+    if target is None:
+        raise CliError(f"Subtask {args.subtask_title} not found in task {parent_task.get('id')}.")
+
+    target["status"] = 1
+    target["completedTime"] = args.completed_time or ticktick_time_now()
+    updated = update_task_items(args, region, token_path, str(parent_task.get("projectId")), str(parent_task.get("id")), items)
+    emit({
+        "ok": True,
+        "parentTask": {
+            "id": parent_task.get("id"),
+            "projectId": parent_task.get("projectId"),
+            "title": parent_task.get("title"),
+            "projectName": parent_task.get("projectName"),
+        },
+        "matchedSubtask": match,
+        "task": updated,
+        "completed_subtask_id": match.get("id"),
+    })
+
+
+def command_subtask_smart_delete(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    parent_task, match = resolve_subtask_selection(
+        args,
+        region,
+        token_path,
+        args.subtask_title,
+        project_id=args.project_id,
+        project_name=args.project_name,
+        task_id=args.task_id,
+        parent_task_title=args.parent_task_title,
+        include_completed=args.include_completed,
+        include_closed_projects=args.include_closed_projects,
+    )
+    existing_items = parent_task.get("items") if isinstance(parent_task.get("items"), list) else []
+    items = [clean_subtask_item(item) for item in existing_items if isinstance(item, dict)]
+    target = find_existing_subtask_item(items, match)
+    if target is None:
+        raise CliError(f"Subtask {args.subtask_title} not found in task {parent_task.get('id')}.")
+
+    remaining = [item for item in items if item is not target]
+    updated = update_task_items(args, region, token_path, str(parent_task.get("projectId")), str(parent_task.get("id")), remaining)
+    emit({
+        "ok": True,
+        "parentTask": {
+            "id": parent_task.get("id"),
+            "projectId": parent_task.get("projectId"),
+            "title": parent_task.get("title"),
+            "projectName": parent_task.get("projectName"),
+        },
+        "matchedSubtask": match,
+        "task": updated,
+        "deleted_subtask_id": match.get("id"),
+    })
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ticktick_openclaw.py",
@@ -1000,6 +1944,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     tasks = subparsers.add_parser("tasks", help="List tasks")
     tasks.add_argument("--project-id")
+    tasks.add_argument("--project-name")
     tasks.add_argument("--include-completed", action="store_true")
     tasks.add_argument("--include-closed-projects", action="store_true")
     tasks.add_argument("--limit", type=int, default=0)
@@ -1007,9 +1952,19 @@ def build_parser() -> argparse.ArgumentParser:
     task_find = subparsers.add_parser("task-find", help="Find tasks by title")
     task_find.add_argument("--title", required=True)
     task_find.add_argument("--project-id")
+    task_find.add_argument("--project-name")
     task_find.add_argument("--include-completed", action="store_true")
     task_find.add_argument("--include-closed-projects", action="store_true")
     task_find.add_argument("--limit", type=int, default=20)
+
+    task_search = subparsers.add_parser("task-search", help="Search tasks across title, content, subtasks, tags, and project")
+    task_search.add_argument("--query", required=True)
+    task_search.add_argument("--project-id")
+    task_search.add_argument("--project-name")
+    task_search.add_argument("--field", action="append", choices=list(TASK_SEARCH_FIELDS), help="Repeat to limit search fields")
+    task_search.add_argument("--include-completed", action="store_true")
+    task_search.add_argument("--include-closed-projects", action="store_true")
+    task_search.add_argument("--limit", type=int, default=20)
 
     task_get = subparsers.add_parser("task-get", help="Get task by project and task id")
     task_get.add_argument("--project-id", required=True)
@@ -1018,6 +1973,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_create = subparsers.add_parser("task-create", help="Create task")
     task_create.add_argument("--title", required=True)
     task_create.add_argument("--project-id")
+    task_create.add_argument("--project-name")
     task_create.add_argument("--content")
     task_create.add_argument("--desc")
     task_create.add_argument("--priority", type=int, choices=[0, 1, 3, 5])
@@ -1047,13 +2003,47 @@ def build_parser() -> argparse.ArgumentParser:
     task_update.add_argument("--clear-due-date", action="store_true")
     task_update.add_argument("--clear-start-date", action="store_true")
 
+    task_smart_update = subparsers.add_parser("task-smart-update", help="Resolve task by title then update it")
+    task_smart_update.add_argument("--task-title", required=True)
+    task_smart_update.add_argument("--project-id")
+    task_smart_update.add_argument("--project-name")
+    task_smart_update.add_argument("--include-completed", action="store_true")
+    task_smart_update.add_argument("--include-closed-projects", action="store_true")
+    task_smart_update.add_argument("--title")
+    task_smart_update.add_argument("--content")
+    task_smart_update.add_argument("--desc")
+    task_smart_update.add_argument("--priority", type=int, choices=[0, 1, 3, 5])
+    task_smart_update.add_argument("--due-date")
+    task_smart_update.add_argument("--start-date")
+    task_smart_update.add_argument("--time-zone")
+    task_smart_update.add_argument("--all-day", action="store_true")
+    task_smart_update.add_argument("--tags", help="Comma-separated tags")
+    task_smart_update.add_argument("--repeat-flag")
+    task_smart_update.add_argument("--reminders", help="Comma-separated reminder triggers")
+    task_smart_update.add_argument("--clear-due-date", action="store_true")
+    task_smart_update.add_argument("--clear-start-date", action="store_true")
+
     task_complete = subparsers.add_parser("task-complete", help="Complete task")
     task_complete.add_argument("--task-id", required=True)
     task_complete.add_argument("--project-id", required=True)
 
+    task_smart_complete = subparsers.add_parser("task-smart-complete", help="Resolve task by title then complete it")
+    task_smart_complete.add_argument("--task-title", required=True)
+    task_smart_complete.add_argument("--project-id")
+    task_smart_complete.add_argument("--project-name")
+    task_smart_complete.add_argument("--include-completed", action="store_true")
+    task_smart_complete.add_argument("--include-closed-projects", action="store_true")
+
     task_delete = subparsers.add_parser("task-delete", help="Delete task")
     task_delete.add_argument("--task-id", required=True)
     task_delete.add_argument("--project-id", required=True)
+
+    task_smart_delete = subparsers.add_parser("task-smart-delete", help="Resolve task by title then delete it")
+    task_smart_delete.add_argument("--task-title", required=True)
+    task_smart_delete.add_argument("--project-id")
+    task_smart_delete.add_argument("--project-name")
+    task_smart_delete.add_argument("--include-completed", action="store_true")
+    task_smart_delete.add_argument("--include-closed-projects", action="store_true")
 
     task_move = subparsers.add_parser("task-move", help="Move one or more tasks between projects")
     task_move.add_argument("--from-project-id", required=True)
@@ -1062,17 +2052,39 @@ def build_parser() -> argparse.ArgumentParser:
 
     tasks_completed = subparsers.add_parser("tasks-completed", help="List completed tasks")
     tasks_completed.add_argument("--project-id", action="append", help="Repeat for multiple project ids")
+    tasks_completed.add_argument("--project-name")
     tasks_completed.add_argument("--start-date")
     tasks_completed.add_argument("--end-date")
 
     tasks_filter = subparsers.add_parser("tasks-filter", help="Filter tasks with server-side criteria")
     tasks_filter.add_argument("--project-id", action="append", help="Repeat for multiple project ids")
+    tasks_filter.add_argument("--project-name")
     tasks_filter.add_argument("--start-date")
     tasks_filter.add_argument("--end-date")
     tasks_filter.add_argument("--priority", help="Comma-separated values, e.g. 0,3,5")
     tasks_filter.add_argument("--tag", help="Comma-separated tags")
     tasks_filter.add_argument("--status", help="Comma-separated values, e.g. 0,2")
     tasks_filter.add_argument("--limit", type=int, default=0)
+
+    tasks_due = subparsers.add_parser("tasks-due", help="List tasks by due window")
+    tasks_due.add_argument("--project-id")
+    tasks_due.add_argument("--project-name")
+    tasks_due.add_argument("--include-closed-projects", action="store_true")
+    tasks_due.add_argument("--limit", type=int, default=0)
+    due_group = tasks_due.add_mutually_exclusive_group(required=True)
+    due_group.add_argument("--when", choices=["today", "tomorrow", "this-week", "overdue"])
+    due_group.add_argument("--days", type=int)
+
+    tasks_focus = subparsers.add_parser("tasks-focus", help="List focused task sets inspired by GTD workflows")
+    tasks_focus.add_argument("--mode", required=True, choices=["engaged", "next"])
+    tasks_focus.add_argument("--project-id")
+    tasks_focus.add_argument("--project-name")
+    tasks_focus.add_argument("--include-closed-projects", action="store_true")
+    tasks_focus.add_argument("--limit", type=int, default=0)
+
+    tasks_batch_create = subparsers.add_parser("tasks-batch-create", help="Create many tasks from a JSON array")
+    tasks_batch_create.add_argument("--json", help="Inline JSON array")
+    tasks_batch_create.add_argument("--json-file", help="Path to JSON file containing an array of task objects")
 
     subtask_add = subparsers.add_parser("subtask-add", help="Add subtask to a parent task")
     subtask_add.add_argument("--project-id", required=True)
@@ -1082,6 +2094,29 @@ def build_parser() -> argparse.ArgumentParser:
     subtask_add.add_argument("--time-zone")
     subtask_add.add_argument("--sort-order", type=int)
     subtask_add.add_argument("--all-day", action="store_true")
+
+    subtask_find = subparsers.add_parser("subtask-find", help="Find subtasks by title under a parent task")
+    subtask_find.add_argument("--project-id")
+    subtask_find.add_argument("--project-name")
+    subtask_find.add_argument("--task-id")
+    subtask_find.add_argument("--parent-task-title")
+    subtask_find.add_argument("--subtask-title", required=True)
+    subtask_find.add_argument("--include-completed", action="store_true")
+    subtask_find.add_argument("--include-closed-projects", action="store_true")
+    subtask_find.add_argument("--limit", type=int, default=20)
+
+    subtask_smart_add = subparsers.add_parser("subtask-smart-add", help="Resolve parent task by title or id, then add a subtask")
+    subtask_smart_add.add_argument("--project-id")
+    subtask_smart_add.add_argument("--project-name")
+    subtask_smart_add.add_argument("--task-id")
+    subtask_smart_add.add_argument("--parent-task-title")
+    subtask_smart_add.add_argument("--title", required=True)
+    subtask_smart_add.add_argument("--start-date")
+    subtask_smart_add.add_argument("--time-zone")
+    subtask_smart_add.add_argument("--sort-order", type=int)
+    subtask_smart_add.add_argument("--all-day", action="store_true")
+    subtask_smart_add.add_argument("--include-completed", action="store_true")
+    subtask_smart_add.add_argument("--include-closed-projects", action="store_true")
 
     subtask_update = subparsers.add_parser("subtask-update", help="Update a subtask")
     subtask_update.add_argument("--project-id", required=True)
@@ -1093,16 +2128,49 @@ def build_parser() -> argparse.ArgumentParser:
     subtask_update.add_argument("--sort-order", type=int)
     subtask_update.add_argument("--all-day", action="store_true")
 
+    subtask_smart_update = subparsers.add_parser("subtask-smart-update", help="Resolve a subtask by title, then update it")
+    subtask_smart_update.add_argument("--project-id")
+    subtask_smart_update.add_argument("--project-name")
+    subtask_smart_update.add_argument("--task-id")
+    subtask_smart_update.add_argument("--parent-task-title")
+    subtask_smart_update.add_argument("--subtask-title", required=True)
+    subtask_smart_update.add_argument("--new-title")
+    subtask_smart_update.add_argument("--start-date")
+    subtask_smart_update.add_argument("--time-zone")
+    subtask_smart_update.add_argument("--sort-order", type=int)
+    subtask_smart_update.add_argument("--all-day", action="store_true")
+    subtask_smart_update.add_argument("--include-completed", action="store_true")
+    subtask_smart_update.add_argument("--include-closed-projects", action="store_true")
+
     subtask_complete = subparsers.add_parser("subtask-complete", help="Complete a subtask")
     subtask_complete.add_argument("--project-id", required=True)
     subtask_complete.add_argument("--task-id", required=True)
     subtask_complete.add_argument("--subtask-id", required=True)
     subtask_complete.add_argument("--completed-time", help="Time in yyyy-MM-dd'T'HH:mm:ssZ")
 
+    subtask_smart_complete = subparsers.add_parser("subtask-smart-complete", help="Resolve a subtask by title, then complete it")
+    subtask_smart_complete.add_argument("--project-id")
+    subtask_smart_complete.add_argument("--project-name")
+    subtask_smart_complete.add_argument("--task-id")
+    subtask_smart_complete.add_argument("--parent-task-title")
+    subtask_smart_complete.add_argument("--subtask-title", required=True)
+    subtask_smart_complete.add_argument("--completed-time", help="Time in yyyy-MM-dd'T'HH:mm:ssZ")
+    subtask_smart_complete.add_argument("--include-completed", action="store_true")
+    subtask_smart_complete.add_argument("--include-closed-projects", action="store_true")
+
     subtask_delete = subparsers.add_parser("subtask-delete", help="Delete a subtask")
     subtask_delete.add_argument("--project-id", required=True)
     subtask_delete.add_argument("--task-id", required=True)
     subtask_delete.add_argument("--subtask-id", required=True)
+
+    subtask_smart_delete = subparsers.add_parser("subtask-smart-delete", help="Resolve a subtask by title, then delete it")
+    subtask_smart_delete.add_argument("--project-id")
+    subtask_smart_delete.add_argument("--project-name")
+    subtask_smart_delete.add_argument("--task-id")
+    subtask_smart_delete.add_argument("--parent-task-title")
+    subtask_smart_delete.add_argument("--subtask-title", required=True)
+    subtask_smart_delete.add_argument("--include-completed", action="store_true")
+    subtask_smart_delete.add_argument("--include-closed-projects", action="store_true")
 
     return parser
 
@@ -1134,30 +2202,54 @@ def run(args: argparse.Namespace) -> None:
         command_tasks(args, region, token_path)
     elif args.command == "task-find":
         command_task_find(args, region, token_path)
+    elif args.command == "task-search":
+        command_task_search(args, region, token_path)
     elif args.command == "task-get":
         command_task_get(args, region, token_path)
     elif args.command == "task-create":
         command_task_create(args, region, token_path)
     elif args.command == "task-update":
         command_task_update(args, region, token_path)
+    elif args.command == "task-smart-update":
+        command_task_smart_update(args, region, token_path)
     elif args.command == "task-complete":
         command_task_complete(args, region, token_path)
+    elif args.command == "task-smart-complete":
+        command_task_smart_complete(args, region, token_path)
     elif args.command == "task-delete":
         command_task_delete(args, region, token_path)
+    elif args.command == "task-smart-delete":
+        command_task_smart_delete(args, region, token_path)
     elif args.command == "task-move":
         command_task_move(args, region, token_path)
     elif args.command == "tasks-completed":
         command_tasks_completed(args, region, token_path)
     elif args.command == "tasks-filter":
         command_tasks_filter(args, region, token_path)
+    elif args.command == "tasks-due":
+        command_tasks_due(args, region, token_path)
+    elif args.command == "tasks-focus":
+        command_tasks_focus(args, region, token_path)
+    elif args.command == "tasks-batch-create":
+        command_tasks_batch_create(args, region, token_path)
     elif args.command == "subtask-add":
         command_subtask_add(args, region, token_path)
+    elif args.command == "subtask-find":
+        command_subtask_find(args, region, token_path)
+    elif args.command == "subtask-smart-add":
+        command_subtask_smart_add(args, region, token_path)
     elif args.command == "subtask-update":
         command_subtask_update(args, region, token_path)
+    elif args.command == "subtask-smart-update":
+        command_subtask_smart_update(args, region, token_path)
     elif args.command == "subtask-complete":
         command_subtask_complete(args, region, token_path)
+    elif args.command == "subtask-smart-complete":
+        command_subtask_smart_complete(args, region, token_path)
     elif args.command == "subtask-delete":
         command_subtask_delete(args, region, token_path)
+    elif args.command == "subtask-smart-delete":
+        command_subtask_smart_delete(args, region, token_path)
     else:
         raise CliError(f"Unsupported command: {args.command}")
 

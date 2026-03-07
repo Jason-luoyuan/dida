@@ -59,18 +59,30 @@ Current script coverage:
 Current script coverage:
 - `tasks`
 - `task-find`
+- `task-search`
 - `task-get`
 - `task-create`
 - `task-update`
+- `task-smart-update`
 - `task-complete`
+- `task-smart-complete`
 - `task-delete`
+- `task-smart-delete`
 - `task-move`
 - `tasks-completed`
 - `tasks-filter`
+- `tasks-due`
+- `tasks-focus`
+- `tasks-batch-create`
 - `subtask-add`
+- `subtask-find`
+- `subtask-smart-add`
 - `subtask-update`
+- `subtask-smart-update`
 - `subtask-complete`
+- `subtask-smart-complete`
 - `subtask-delete`
+- `subtask-smart-delete`
 
 ## Common Task Fields
 
@@ -87,10 +99,21 @@ Current script coverage:
 - `tags`
 - `items` (subtasks/checklist items under a parent task)
 
+## Higher-Level Wrappers
+
+These commands are wrappers over the official endpoints above, not additional vendor APIs:
+- `task-search`: searches locally across task title, content, desc, subtasks, tags, and project names after pulling official task data.
+- `task-smart-*`: resolves task titles to stable IDs, then calls the official update/complete/delete endpoints.
+- `tasks-due`: filters official task data into `today`, `tomorrow`, `this-week`, `overdue`, or `--days N` views.
+- `tasks-focus`: returns `engaged` and `next` task sets inspired by GTD-style review workflows.
+- `tasks-batch-create`: loops official `POST /task` calls from a JSON array.
+- `subtask-find` and `subtask-smart-*`: resolve parent task/subtask titles, then update the official `items` field on the parent task.
+
 ## Command Design Notes
 
 - Always return JSON for agent parsing.
-- Accept `projectId` + `taskId` for update/complete/delete to avoid ambiguous lookup.
+- Accept `projectId` + `taskId` for low-level update/complete/delete to avoid ambiguous lookup.
+- Accept `project-name` on list/create/filter flows to reduce agent-side lookup overhead.
 - Default project target can be `inbox` when creating quick tasks.
 - Refresh access token before API calls when near expiry.
 - Parent/subtask management is done by reading/updating task `items` (there is no separate parentTaskId endpoint in OpenAPI).

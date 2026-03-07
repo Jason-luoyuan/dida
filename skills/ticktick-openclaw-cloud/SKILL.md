@@ -1,32 +1,38 @@
 ---
 name: ticktick-openclaw-cloud
-description: Manage Dida365/TickTick tasks and projects from cloud-hosted OpenClaw using a headless OAuth flow, token auto-refresh, and JSON CLI operations. Use when users ask to connect Dida/TickTick accounts, create/update/complete/delete tasks, manage parent-task and subtask structures, list projects/tasks, or troubleshoot auth/token issues in environments without local callback servers.
+description: Manage Dida365/TickTick tasks and projects from cloud-hosted OpenClaw using a headless OAuth flow, token auto-refresh, smart name resolution, JSON CLI operations, and parent-task/subtask workflows. Use when users ask to connect Dida/TickTick accounts, create/update/complete/delete tasks, search tasks by title or content, manage parent-task and subtask structures, list projects/tasks, or troubleshoot auth/token issues in environments without local callback servers.
 ---
 
 # TickTick OpenClaw Cloud
 
 ## Overview
 
-Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the bundled script for OAuth authorization URL generation, callback exchange, token refresh, task/project CRUD, and parent-task/subtask operations.
+Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the bundled script for OAuth authorization URL generation, callback exchange, token refresh, task/project CRUD, smart name-based resolution, broader task search, due-date views, batch creation, and parent-task/subtask operations.
 
 ## Smart Execution Rules
 
-1. For create requests, prefer direct execution. If the user names a project, resolve it with `project-find`; if no project is given, default to `inbox`.
-2. For update, complete, delete, or move requests, first resolve identity. Use `task-get` when the user provides IDs; otherwise use `task-find` and narrow by project when possible.
-3. If `task-find` returns one strong match (`exact` or a clearly dominant `prefix` match), proceed without asking. If multiple plausible matches remain, ask one short clarification.
-4. Before `task-update`, fetch the current task and preserve unspecified fields. Only change the fields the user asked to change.
-5. For checklist-style requests, treat the parent task as the main task and subtasks as `items`. Use `task-create --subtask ...` on creation and `subtask-*` commands for later edits.
-6. For reporting or smart selection requests like "show overdue/high priority/completed last week", prefer `tasks-filter` or `tasks-completed` before falling back to full project scans.
-7. Never invent due dates, priorities, or project names unless the user implied them clearly. If urgency is explicit, map priority as low=`1`, medium=`3`, high=`5`.
-8. When a task title is ambiguous across projects, prefer the project mentioned by the user. If none is mentioned, return the smallest matching set and ask for disambiguation only if needed.
+1. For create requests, prefer direct execution. If the user names a project, pass `--project-name`; if no project is given, default to `inbox`.
+2. For update, complete, or delete requests where the user gives a task title instead of IDs, prefer `task-smart-update`, `task-smart-complete`, or `task-smart-delete`.
+3. Use `task-find` for title-only resolution. Use `task-search` when the user references task content, descriptions, subtasks, tags, or project text.
+4. If a single exact match exists, proceed. If one match clearly outranks the rest, proceed. If multiple plausible matches remain, ask one short clarification.
+5. For date-oriented requests like "today", "tomorrow", "this week", or "overdue", prefer `tasks-due`. For focus-oriented requests like "engaged" or "next", prefer `tasks-focus`.
+6. For batch creation requests, use `tasks-batch-create` with a JSON array instead of looping one task at a time.
+7. For checklist-style requests, treat the parent task as the main task and subtasks as `items`. Use `task-create --subtask ...` when creating a parent task. For existing parent tasks without IDs, use `subtask-find` and `subtask-smart-*`.
+8. Before `task-update` or `task-smart-update`, change only the fields the user explicitly asked to change.
+9. Never invent due dates, priorities, or project names unless the user implied them clearly. If urgency is explicit, map priority as low=`1`, medium=`3`, high=`5`.
+10. When a task title is ambiguous across projects, prefer the project mentioned by the user. If none is mentioned, return the smallest matching set and ask only if needed.
 
 ## Common Intent Mapping
 
-- "Create a task": resolve project, then `task-create`
-- "Update/rename a task": `task-find` -> `task-get` -> `task-update`
-- "Mark a task done": `task-find` -> `task-complete`
-- "Delete a task": `task-find` -> `task-delete`
-- "Add or edit subtasks": `task-find` -> `task-get` -> `subtask-*`
+- "Create a task": `task-create --project-name ...`
+- "Update or rename a task": `task-smart-update`
+- "Mark a task done": `task-smart-complete`
+- "Delete a task": `task-smart-delete`
+- "Search tasks by note/content/subtask": `task-search`
+- "Show due today / overdue / this week": `tasks-due`
+- "Show engaged / next tasks": `tasks-focus`
+- "Create many tasks": `tasks-batch-create`
+- "Add or edit subtasks without IDs": `subtask-smart-add` / `subtask-smart-update` / `subtask-smart-complete` / `subtask-smart-delete`
 - "Move tasks between projects": resolve both projects, resolve tasks, then `task-move`
 
 ## Quick Start (Cloud OAuth)
@@ -52,19 +58,20 @@ Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the b
 6. Start task management:
    ```bash
    python {baseDir}/scripts/ticktick_openclaw.py projects
-   python {baseDir}/scripts/ticktick_openclaw.py task-create --title "Prepare weekly report" --project-id inbox --priority 3
+   python {baseDir}/scripts/ticktick_openclaw.py task-create --title "Prepare weekly report" --project-name "Work" --priority 3
    ```
 
 ## Command Workflow
 
 1. Use `project-find` when the user gives a project name rather than an ID.
-2. Use `task-find` when the user gives a task title rather than an ID.
-3. Use `project-get` and `project-update` when you need exact project metadata edits.
-4. Use `task-create`, `task-update`, `task-complete`, `task-delete` for lifecycle actions.
-5. Use `task-get` and `subtask-*` commands to manage parent-task/subtask structures.
-6. Use `task-move`, `tasks-filter`, and `tasks-completed` for bulk or reporting workflows.
-7. Prefer passing `projectId + taskId` directly when already known.
-8. Use `token-status --auto-refresh` before long task batches.
+2. Use `task-find` for strict title matching and `task-search` for broader semantic lookup.
+3. Use `task-smart-update`, `task-smart-complete`, and `task-smart-delete` when only a task title is known.
+4. Use `task-create --project-name` for direct creation without a prior project lookup step.
+5. Use `task-get` and `subtask-*` commands when IDs are already known.
+6. Use `subtask-find` and `subtask-smart-*` when the user references parent/subtask titles instead of IDs.
+7. Use `tasks-due`, `tasks-focus`, `tasks-filter`, and `tasks-completed` for reporting or review workflows.
+8. Use `tasks-batch-create` when the user provides multiple tasks in one turn.
+9. Use `token-status --auto-refresh` before long task batches.
 
 ## Core Commands
 
@@ -83,27 +90,34 @@ python {baseDir}/scripts/ticktick_openclaw.py project-update --project-id "<proj
 python {baseDir}/scripts/ticktick_openclaw.py project-delete --project-id "<project_id>"
 
 # Tasks
-python {baseDir}/scripts/ticktick_openclaw.py tasks --project-id "<project_id>"
-python {baseDir}/scripts/ticktick_openclaw.py task-find --title "Prepare proposal" --project-id "<project_id>"
-python {baseDir}/scripts/ticktick_openclaw.py task-create --title "Prepare proposal" --project-id "<project_id>" --priority 5 --subtask "Draft" --subtask "Review"
-python {baseDir}/scripts/ticktick_openclaw.py task-get --task-id "<task_id>" --project-id "<project_id>"
-python {baseDir}/scripts/ticktick_openclaw.py task-update --task-id "<task_id>" --project-id "<project_id>" --title "Updated title"
-python {baseDir}/scripts/ticktick_openclaw.py subtask-add --task-id "<task_id>" --project-id "<project_id>" --title "Collect feedback"
-python {baseDir}/scripts/ticktick_openclaw.py subtask-update --task-id "<task_id>" --project-id "<project_id>" --subtask-id "<subtask_id>" --title "Feedback complete"
-python {baseDir}/scripts/ticktick_openclaw.py subtask-complete --task-id "<task_id>" --project-id "<project_id>" --subtask-id "<subtask_id>"
-python {baseDir}/scripts/ticktick_openclaw.py subtask-delete --task-id "<task_id>" --project-id "<project_id>" --subtask-id "<subtask_id>"
+python {baseDir}/scripts/ticktick_openclaw.py tasks --project-name "Work"
+python {baseDir}/scripts/ticktick_openclaw.py task-find --title "Prepare proposal" --project-name "Work"
+python {baseDir}/scripts/ticktick_openclaw.py task-search --query "proposal draft" --field title --field content --field subtask
+python {baseDir}/scripts/ticktick_openclaw.py task-create --title "Prepare proposal" --project-name "Work" --priority 5 --subtask "Draft" --subtask "Review"
+python {baseDir}/scripts/ticktick_openclaw.py task-smart-update --task-title "Prepare proposal" --project-name "Work" --due-date "2026-03-10T18:00:00+0800"
+python {baseDir}/scripts/ticktick_openclaw.py task-smart-complete --task-title "Prepare proposal" --project-name "Work"
+python {baseDir}/scripts/ticktick_openclaw.py task-smart-delete --task-title "Prepare proposal" --project-name "Work"
+python {baseDir}/scripts/ticktick_openclaw.py tasks-due --when overdue
+python {baseDir}/scripts/ticktick_openclaw.py tasks-focus --mode engaged
+python {baseDir}/scripts/ticktick_openclaw.py tasks-batch-create --json-file "tasks.json"
 python {baseDir}/scripts/ticktick_openclaw.py task-move --from-project-id "<project_id>" --to-project-id "<other_project_id>" --task-id "<task_id>"
-python {baseDir}/scripts/ticktick_openclaw.py tasks-filter --project-id "<project_id>" --status 0 --priority 3,5
-python {baseDir}/scripts/ticktick_openclaw.py tasks-completed --project-id "<project_id>" --start-date "2026-03-01T00:00:00+0000" --end-date "2026-03-08T23:59:59+0000"
-python {baseDir}/scripts/ticktick_openclaw.py task-complete --task-id "<task_id>" --project-id "<project_id>"
-python {baseDir}/scripts/ticktick_openclaw.py task-delete --task-id "<task_id>" --project-id "<project_id>"
+python {baseDir}/scripts/ticktick_openclaw.py tasks-filter --project-name "Work" --status 0 --priority 3,5
+python {baseDir}/scripts/ticktick_openclaw.py tasks-completed --project-name "Work" --start-date "2026-03-01T00:00:00+0000" --end-date "2026-03-08T23:59:59+0000"
+
+# Subtasks
+python {baseDir}/scripts/ticktick_openclaw.py subtask-find --parent-task-title "Prepare proposal" --subtask-title "Draft"
+python {baseDir}/scripts/ticktick_openclaw.py subtask-smart-add --parent-task-title "Prepare proposal" --title "Collect feedback"
+python {baseDir}/scripts/ticktick_openclaw.py subtask-smart-update --parent-task-title "Prepare proposal" --subtask-title "Draft" --new-title "Draft v2"
+python {baseDir}/scripts/ticktick_openclaw.py subtask-smart-complete --parent-task-title "Prepare proposal" --subtask-title "Draft v2"
+python {baseDir}/scripts/ticktick_openclaw.py subtask-smart-delete --parent-task-title "Prepare proposal" --subtask-title "Draft v2"
 ```
 
 ## Input Conventions
 
 - Date-time fields use `"yyyy-MM-dd'T'HH:mm:ssZ"` format, for example `2026-03-08T10:00:00+0800`.
 - Priority values: `0` (none), `1` (low), `3` (medium), `5` (high).
-- `project-id` can be regular project ID or `inbox`.
+- `project-id` can be a regular project ID or `inbox`.
+- `project-name` is resolved by exact/prefix/contains matching.
 - Subtasks map to the official `items` field in task objects.
 - Script outputs JSON by default for agent-safe parsing.
 
@@ -113,6 +127,7 @@ python {baseDir}/scripts/ticktick_openclaw.py task-delete --task-id "<task_id>" 
 2. Use `dida` region for Dida365 accounts and `ticktick` for TickTick accounts.
 3. If callback exchange fails with state mismatch, regenerate URL via `auth-url`.
 4. If refresh fails, re-run `auth-url` + `auth-exchange`.
+5. `task-search`, `tasks-due`, `tasks-focus`, `tasks-batch-create`, and all `*-smart-*` commands are convenience wrappers over the official endpoints already documented in `references/openapi-cheatsheet.md`.
 
 ## References
 
