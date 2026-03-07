@@ -329,6 +329,23 @@ def clean_subtask_item(item: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in item.items() if key in allowed_keys}
 
 
+def parse_csv_strings(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [chunk.strip() for chunk in value.split(",") if chunk.strip()]
+
+
+def parse_csv_ints(value: str | None) -> list[int]:
+    values = parse_csv_strings(value)
+    parsed: list[int] = []
+    for value in values:
+        try:
+            parsed.append(int(value))
+        except ValueError as exc:
+            raise CliError(f"Invalid integer value '{value}'.") from exc
+    return parsed
+
+
 def fetch_task(args: argparse.Namespace, region: RegionConfig, token_path: Path, project_id: str, task_id: str) -> dict[str, Any]:
     response = api_request(args, region, token_path, "GET", f"/project/{project_id}/task/{task_id}")
     if not isinstance(response, dict):
@@ -503,6 +520,11 @@ def command_projects(args: argparse.Namespace, region: RegionConfig, token_path:
     emit({"ok": True, "count": len(projects), "projects": projects})
 
 
+def command_project_get(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    project = api_request(args, region, token_path, "GET", f"/project/{args.project_id}")
+    emit({"ok": True, "project": project})
+
+
 def command_project_create(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
     payload: dict[str, Any] = {"name": args.name}
     if args.color:
@@ -511,8 +533,29 @@ def command_project_create(args: argparse.Namespace, region: RegionConfig, token
         payload["viewMode"] = args.view_mode
     if args.kind:
         payload["kind"] = args.kind
+    if args.sort_order is not None:
+        payload["sortOrder"] = args.sort_order
 
     project = api_request(args, region, token_path, "POST", "/project", json_body=payload)
+    emit({"ok": True, "project": project})
+
+
+def command_project_update(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    payload: dict[str, Any] = {}
+    if args.name:
+        payload["name"] = args.name
+    if args.color:
+        payload["color"] = args.color
+    if args.view_mode:
+        payload["viewMode"] = args.view_mode
+    if args.kind:
+        payload["kind"] = args.kind
+    if args.sort_order is not None:
+        payload["sortOrder"] = args.sort_order
+    if not payload:
+        raise CliError("No project update fields provided.")
+
+    project = api_request(args, region, token_path, "POST", f"/project/{args.project_id}", json_body=payload)
     emit({"ok": True, "project": project})
 
 
@@ -667,6 +710,56 @@ def command_task_get(args: argparse.Namespace, region: RegionConfig, token_path:
     emit({"ok": True, "task": task, "subtask_count": subtask_count})
 
 
+def command_task_move(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    payload = [
+        {
+            "fromProjectId": args.from_project_id,
+            "toProjectId": args.to_project_id,
+            "taskId": task_id,
+        }
+        for task_id in args.task_id
+    ]
+    response = api_request(args, region, token_path, "POST", "/task/move", json_body=payload)
+    moved = response if isinstance(response, list) else []
+    emit({"ok": True, "count": len(moved), "moved": moved})
+
+
+def command_tasks_completed(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    payload: dict[str, Any] = {}
+    if args.project_id:
+        payload["projectIds"] = args.project_id
+    if args.start_date:
+        payload["startDate"] = args.start_date
+    if args.end_date:
+        payload["endDate"] = args.end_date
+
+    response = api_request(args, region, token_path, "POST", "/task/completed", json_body=payload)
+    tasks = response if isinstance(response, list) else []
+    emit({"ok": True, "count": len(tasks), "tasks": tasks})
+
+
+def command_tasks_filter(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    payload: dict[str, Any] = {}
+    if args.project_id:
+        payload["projectIds"] = args.project_id
+    if args.start_date:
+        payload["startDate"] = args.start_date
+    if args.end_date:
+        payload["endDate"] = args.end_date
+    if args.priority:
+        payload["priority"] = parse_csv_ints(args.priority)
+    if args.tag:
+        payload["tag"] = parse_csv_strings(args.tag)
+    if args.status:
+        payload["status"] = parse_csv_ints(args.status)
+
+    response = api_request(args, region, token_path, "POST", "/task/filter", json_body=payload)
+    tasks = response if isinstance(response, list) else []
+    if args.limit and args.limit > 0:
+        tasks = tasks[: args.limit]
+    emit({"ok": True, "count": len(tasks), "tasks": tasks})
+
+
 def command_subtask_add(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
     task = fetch_task(args, region, token_path, args.project_id, args.task_id)
     existing_items = task.get("items") if isinstance(task.get("items"), list) else []
@@ -790,11 +883,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("projects", help="List projects")
 
+    project_get = subparsers.add_parser("project-get", help="Get project by id")
+    project_get.add_argument("--project-id", required=True)
+
     project_create = subparsers.add_parser("project-create", help="Create project")
     project_create.add_argument("--name", required=True)
     project_create.add_argument("--color")
     project_create.add_argument("--view-mode", choices=["list", "kanban", "timeline"])
     project_create.add_argument("--kind", choices=["TASK", "NOTE"])
+    project_create.add_argument("--sort-order", type=int)
+
+    project_update = subparsers.add_parser("project-update", help="Update project")
+    project_update.add_argument("--project-id", required=True)
+    project_update.add_argument("--name")
+    project_update.add_argument("--color")
+    project_update.add_argument("--view-mode", choices=["list", "kanban", "timeline"])
+    project_update.add_argument("--kind", choices=["TASK", "NOTE"])
+    project_update.add_argument("--sort-order", type=int)
 
     project_delete = subparsers.add_parser("project-delete", help="Delete project")
     project_delete.add_argument("--project-id", required=True)
@@ -849,6 +954,25 @@ def build_parser() -> argparse.ArgumentParser:
     task_delete.add_argument("--task-id", required=True)
     task_delete.add_argument("--project-id", required=True)
 
+    task_move = subparsers.add_parser("task-move", help="Move one or more tasks between projects")
+    task_move.add_argument("--from-project-id", required=True)
+    task_move.add_argument("--to-project-id", required=True)
+    task_move.add_argument("--task-id", action="append", required=True, help="Repeat for multiple task ids")
+
+    tasks_completed = subparsers.add_parser("tasks-completed", help="List completed tasks")
+    tasks_completed.add_argument("--project-id", action="append", help="Repeat for multiple project ids")
+    tasks_completed.add_argument("--start-date")
+    tasks_completed.add_argument("--end-date")
+
+    tasks_filter = subparsers.add_parser("tasks-filter", help="Filter tasks with server-side criteria")
+    tasks_filter.add_argument("--project-id", action="append", help="Repeat for multiple project ids")
+    tasks_filter.add_argument("--start-date")
+    tasks_filter.add_argument("--end-date")
+    tasks_filter.add_argument("--priority", help="Comma-separated values, e.g. 0,3,5")
+    tasks_filter.add_argument("--tag", help="Comma-separated tags")
+    tasks_filter.add_argument("--status", help="Comma-separated values, e.g. 0,2")
+    tasks_filter.add_argument("--limit", type=int, default=0)
+
     subtask_add = subparsers.add_parser("subtask-add", help="Add subtask to a parent task")
     subtask_add.add_argument("--project-id", required=True)
     subtask_add.add_argument("--task-id", required=True)
@@ -895,8 +1019,12 @@ def run(args: argparse.Namespace) -> None:
         command_token_status(args, region, token_path)
     elif args.command == "projects":
         command_projects(args, region, token_path)
+    elif args.command == "project-get":
+        command_project_get(args, region, token_path)
     elif args.command == "project-create":
         command_project_create(args, region, token_path)
+    elif args.command == "project-update":
+        command_project_update(args, region, token_path)
     elif args.command == "project-delete":
         command_project_delete(args, region, token_path)
     elif args.command == "tasks":
@@ -911,6 +1039,12 @@ def run(args: argparse.Namespace) -> None:
         command_task_complete(args, region, token_path)
     elif args.command == "task-delete":
         command_task_delete(args, region, token_path)
+    elif args.command == "task-move":
+        command_task_move(args, region, token_path)
+    elif args.command == "tasks-completed":
+        command_tasks_completed(args, region, token_path)
+    elif args.command == "tasks-filter":
+        command_tasks_filter(args, region, token_path)
     elif args.command == "subtask-add":
         command_subtask_add(args, region, token_path)
     elif args.command == "subtask-update":

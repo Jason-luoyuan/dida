@@ -37,6 +37,13 @@ Token refresh endpoint:
 - `POST /project/{projectId}`
 - `DELETE /project/{projectId}`
 
+Current script coverage:
+- `projects`
+- `project-get`
+- `project-create`
+- `project-update`
+- `project-delete`
+
 ## Task Endpoints
 
 - `GET /project/{projectId}/task/{taskId}`
@@ -47,6 +54,21 @@ Token refresh endpoint:
 - `POST /task/move`
 - `POST /task/completed`
 - `POST /task/filter`
+
+Current script coverage:
+- `tasks`
+- `task-get`
+- `task-create`
+- `task-update`
+- `task-complete`
+- `task-delete`
+- `task-move`
+- `tasks-completed`
+- `tasks-filter`
+- `subtask-add`
+- `subtask-update`
+- `subtask-complete`
+- `subtask-delete`
 
 ## Common Task Fields
 

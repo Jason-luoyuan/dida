@@ -39,10 +39,12 @@ Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the b
 
 1. Use `projects` first to obtain reliable `projectId`.
 2. Use `tasks --project-id <id>` to fetch current tasks.
-3. Use `task-create`, `task-update`, `task-complete`, `task-delete` for lifecycle actions.
-4. Use `task-get` and `subtask-*` commands to manage parent-task/subtask structures.
-5. Prefer passing `projectId + taskId` directly for deterministic updates.
-6. Use `token-status --auto-refresh` before long task batches.
+3. Use `project-get` and `project-update` when you need exact project metadata edits.
+4. Use `task-create`, `task-update`, `task-complete`, `task-delete` for lifecycle actions.
+5. Use `task-get` and `subtask-*` commands to manage parent-task/subtask structures.
+6. Use `task-move`, `tasks-filter`, and `tasks-completed` for bulk or reporting workflows.
+7. Prefer passing `projectId + taskId` directly for deterministic updates.
+8. Use `token-status --auto-refresh` before long task batches.
 
 ## Core Commands
 
@@ -55,6 +57,8 @@ python {baseDir}/scripts/ticktick_openclaw.py token-status --auto-refresh
 # Projects
 python {baseDir}/scripts/ticktick_openclaw.py projects
 python {baseDir}/scripts/ticktick_openclaw.py project-create --name "Work"
+python {baseDir}/scripts/ticktick_openclaw.py project-get --project-id "<project_id>"
+python {baseDir}/scripts/ticktick_openclaw.py project-update --project-id "<project_id>" --name "Work Ops" --view-mode kanban
 python {baseDir}/scripts/ticktick_openclaw.py project-delete --project-id "<project_id>"
 
 # Tasks
@@ -66,6 +70,9 @@ python {baseDir}/scripts/ticktick_openclaw.py subtask-add --task-id "<task_id>" 
 python {baseDir}/scripts/ticktick_openclaw.py subtask-update --task-id "<task_id>" --project-id "<project_id>" --subtask-id "<subtask_id>" --title "Feedback complete"
 python {baseDir}/scripts/ticktick_openclaw.py subtask-complete --task-id "<task_id>" --project-id "<project_id>" --subtask-id "<subtask_id>"
 python {baseDir}/scripts/ticktick_openclaw.py subtask-delete --task-id "<task_id>" --project-id "<project_id>" --subtask-id "<subtask_id>"
+python {baseDir}/scripts/ticktick_openclaw.py task-move --from-project-id "<project_id>" --to-project-id "<other_project_id>" --task-id "<task_id>"
+python {baseDir}/scripts/ticktick_openclaw.py tasks-filter --project-id "<project_id>" --status 0 --priority 3,5
+python {baseDir}/scripts/ticktick_openclaw.py tasks-completed --project-id "<project_id>" --start-date "2026-03-01T00:00:00+0000" --end-date "2026-03-08T23:59:59+0000"
 python {baseDir}/scripts/ticktick_openclaw.py task-complete --task-id "<task_id>" --project-id "<project_id>"
 python {baseDir}/scripts/ticktick_openclaw.py task-delete --task-id "<task_id>" --project-id "<project_id>"
 ```
