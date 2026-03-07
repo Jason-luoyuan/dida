@@ -61,6 +61,7 @@ Token refresh endpoint:
 - `timeZone`
 - `isAllDay`
 - `tags`
+- `items` (subtasks/checklist items under a parent task)
 
 ## Command Design Notes
 
@@ -68,3 +69,4 @@ Token refresh endpoint:
 - Accept `projectId` + `taskId` for update/complete/delete to avoid ambiguous lookup.
 - Default project target can be `inbox` when creating quick tasks.
 - Refresh access token before API calls when near expiry.
+- Parent/subtask management is done by reading/updating task `items` (there is no separate parentTaskId endpoint in OpenAPI).

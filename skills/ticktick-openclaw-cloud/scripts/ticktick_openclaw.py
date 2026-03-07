@@ -52,6 +52,10 @@ def iso_utc() -> str:
     return now_utc().isoformat()
 
 
+def ticktick_time_now() -> str:
+    return now_utc().strftime("%Y-%m-%dT%H:%M:%S+0000")
+
+
 def emit(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
@@ -311,6 +315,46 @@ def api_request(
     )
 
 
+def clean_subtask_item(item: dict[str, Any]) -> dict[str, Any]:
+    allowed_keys = {
+        "id",
+        "title",
+        "status",
+        "completedTime",
+        "isAllDay",
+        "sortOrder",
+        "startDate",
+        "timeZone",
+    }
+    return {key: value for key, value in item.items() if key in allowed_keys}
+
+
+def fetch_task(args: argparse.Namespace, region: RegionConfig, token_path: Path, project_id: str, task_id: str) -> dict[str, Any]:
+    response = api_request(args, region, token_path, "GET", f"/project/{project_id}/task/{task_id}")
+    if not isinstance(response, dict):
+        raise CliError("Unexpected task response format.")
+    return response
+
+
+def update_task_items(
+    args: argparse.Namespace,
+    region: RegionConfig,
+    token_path: Path,
+    project_id: str,
+    task_id: str,
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    payload = {
+        "id": task_id,
+        "projectId": project_id,
+        "items": [clean_subtask_item(item) for item in items],
+    }
+    response = api_request(args, region, token_path, "POST", f"/task/{task_id}", json_body=payload)
+    if not isinstance(response, dict):
+        raise CliError("Unexpected task update response format.")
+    return response
+
+
 def command_auth_url(args: argparse.Namespace, region: RegionConfig, state_path: Path) -> None:
     client_id = required_value(args, "client_id", "TICKTICK_CLIENT_ID", "client id")
     redirect_uri = required_value(args, "redirect_uri", "TICKTICK_REDIRECT_URI", "redirect uri")
@@ -546,6 +590,7 @@ def build_task_payload(args: argparse.Namespace, include_identity: bool) -> dict
         "dueDate": args.due_date,
         "startDate": args.start_date,
         "timeZone": args.time_zone,
+        "repeatFlag": getattr(args, "repeat_flag", None),
     }
 
     for key, value in mapping.items():
@@ -560,6 +605,14 @@ def build_task_payload(args: argparse.Namespace, include_identity: bool) -> dict
 
     if args.tags:
         payload["tags"] = [tag.strip() for tag in args.tags.split(",") if tag.strip()]
+
+    reminders = getattr(args, "reminders", None)
+    if reminders:
+        payload["reminders"] = [item.strip() for item in reminders.split(",") if item.strip()]
+
+    subtasks = getattr(args, "subtask", None)
+    if subtasks:
+        payload["items"] = [{"title": value} for value in subtasks if value and value.strip()]
 
     if include_identity:
         if args.clear_due_date:
@@ -608,6 +661,104 @@ def command_task_delete(args: argparse.Namespace, region: RegionConfig, token_pa
     emit({"ok": True, "deleted_task_id": args.task_id, "project_id": args.project_id})
 
 
+def command_task_get(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    task = fetch_task(args, region, token_path, args.project_id, args.task_id)
+    subtask_count = len(task.get("items", [])) if isinstance(task.get("items"), list) else 0
+    emit({"ok": True, "task": task, "subtask_count": subtask_count})
+
+
+def command_subtask_add(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    task = fetch_task(args, region, token_path, args.project_id, args.task_id)
+    existing_items = task.get("items") if isinstance(task.get("items"), list) else []
+    items = [clean_subtask_item(item) for item in existing_items if isinstance(item, dict)]
+
+    new_item: dict[str, Any] = {"title": args.title}
+    if args.start_date:
+        new_item["startDate"] = args.start_date
+    if args.time_zone:
+        new_item["timeZone"] = args.time_zone
+    if args.sort_order is not None:
+        new_item["sortOrder"] = args.sort_order
+    if args.all_day:
+        new_item["isAllDay"] = True
+
+    items.append(new_item)
+    updated = update_task_items(args, region, token_path, args.project_id, args.task_id, items)
+    updated_items = updated.get("items") if isinstance(updated.get("items"), list) else []
+    emit({"ok": True, "task": updated, "subtask_count": len(updated_items)})
+
+
+def command_subtask_update(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    task = fetch_task(args, region, token_path, args.project_id, args.task_id)
+    existing_items = task.get("items") if isinstance(task.get("items"), list) else []
+    items = [clean_subtask_item(item) for item in existing_items if isinstance(item, dict)]
+
+    target = None
+    for item in items:
+        if str(item.get("id", "")) == args.subtask_id:
+            target = item
+            break
+
+    if target is None:
+        raise CliError(f"Subtask {args.subtask_id} not found in task {args.task_id}.")
+
+    changed = False
+    if args.title:
+        target["title"] = args.title
+        changed = True
+    if args.start_date is not None:
+        target["startDate"] = args.start_date
+        changed = True
+    if args.time_zone is not None:
+        target["timeZone"] = args.time_zone
+        changed = True
+    if args.sort_order is not None:
+        target["sortOrder"] = args.sort_order
+        changed = True
+    if args.all_day:
+        target["isAllDay"] = True
+        changed = True
+
+    if not changed:
+        raise CliError("No subtask update fields provided.")
+
+    updated = update_task_items(args, region, token_path, args.project_id, args.task_id, items)
+    emit({"ok": True, "task": updated})
+
+
+def command_subtask_complete(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    task = fetch_task(args, region, token_path, args.project_id, args.task_id)
+    existing_items = task.get("items") if isinstance(task.get("items"), list) else []
+    items = [clean_subtask_item(item) for item in existing_items if isinstance(item, dict)]
+
+    found = False
+    for item in items:
+        if str(item.get("id", "")) == args.subtask_id:
+            item["status"] = 1
+            item["completedTime"] = args.completed_time or ticktick_time_now()
+            found = True
+            break
+
+    if not found:
+        raise CliError(f"Subtask {args.subtask_id} not found in task {args.task_id}.")
+
+    updated = update_task_items(args, region, token_path, args.project_id, args.task_id, items)
+    emit({"ok": True, "task": updated, "completed_subtask_id": args.subtask_id})
+
+
+def command_subtask_delete(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    task = fetch_task(args, region, token_path, args.project_id, args.task_id)
+    existing_items = task.get("items") if isinstance(task.get("items"), list) else []
+    items = [clean_subtask_item(item) for item in existing_items if isinstance(item, dict)]
+
+    remaining = [item for item in items if str(item.get("id", "")) != args.subtask_id]
+    if len(remaining) == len(items):
+        raise CliError(f"Subtask {args.subtask_id} not found in task {args.task_id}.")
+
+    updated = update_task_items(args, region, token_path, args.project_id, args.task_id, remaining)
+    emit({"ok": True, "task": updated, "deleted_subtask_id": args.subtask_id})
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ticktick_openclaw.py",
@@ -654,6 +805,10 @@ def build_parser() -> argparse.ArgumentParser:
     tasks.add_argument("--include-closed-projects", action="store_true")
     tasks.add_argument("--limit", type=int, default=0)
 
+    task_get = subparsers.add_parser("task-get", help="Get task by project and task id")
+    task_get.add_argument("--project-id", required=True)
+    task_get.add_argument("--task-id", required=True)
+
     task_create = subparsers.add_parser("task-create", help="Create task")
     task_create.add_argument("--title", required=True)
     task_create.add_argument("--project-id")
@@ -665,6 +820,9 @@ def build_parser() -> argparse.ArgumentParser:
     task_create.add_argument("--time-zone")
     task_create.add_argument("--all-day", action="store_true")
     task_create.add_argument("--tags", help="Comma-separated tags")
+    task_create.add_argument("--repeat-flag")
+    task_create.add_argument("--reminders", help="Comma-separated reminder triggers")
+    task_create.add_argument("--subtask", action="append", help="Subtask title, repeatable")
 
     task_update = subparsers.add_parser("task-update", help="Update task")
     task_update.add_argument("--task-id", required=True)
@@ -678,6 +836,8 @@ def build_parser() -> argparse.ArgumentParser:
     task_update.add_argument("--time-zone")
     task_update.add_argument("--all-day", action="store_true")
     task_update.add_argument("--tags", help="Comma-separated tags")
+    task_update.add_argument("--repeat-flag")
+    task_update.add_argument("--reminders", help="Comma-separated reminder triggers")
     task_update.add_argument("--clear-due-date", action="store_true")
     task_update.add_argument("--clear-start-date", action="store_true")
 
@@ -688,6 +848,36 @@ def build_parser() -> argparse.ArgumentParser:
     task_delete = subparsers.add_parser("task-delete", help="Delete task")
     task_delete.add_argument("--task-id", required=True)
     task_delete.add_argument("--project-id", required=True)
+
+    subtask_add = subparsers.add_parser("subtask-add", help="Add subtask to a parent task")
+    subtask_add.add_argument("--project-id", required=True)
+    subtask_add.add_argument("--task-id", required=True)
+    subtask_add.add_argument("--title", required=True)
+    subtask_add.add_argument("--start-date")
+    subtask_add.add_argument("--time-zone")
+    subtask_add.add_argument("--sort-order", type=int)
+    subtask_add.add_argument("--all-day", action="store_true")
+
+    subtask_update = subparsers.add_parser("subtask-update", help="Update a subtask")
+    subtask_update.add_argument("--project-id", required=True)
+    subtask_update.add_argument("--task-id", required=True)
+    subtask_update.add_argument("--subtask-id", required=True)
+    subtask_update.add_argument("--title")
+    subtask_update.add_argument("--start-date")
+    subtask_update.add_argument("--time-zone")
+    subtask_update.add_argument("--sort-order", type=int)
+    subtask_update.add_argument("--all-day", action="store_true")
+
+    subtask_complete = subparsers.add_parser("subtask-complete", help="Complete a subtask")
+    subtask_complete.add_argument("--project-id", required=True)
+    subtask_complete.add_argument("--task-id", required=True)
+    subtask_complete.add_argument("--subtask-id", required=True)
+    subtask_complete.add_argument("--completed-time", help="Time in yyyy-MM-dd'T'HH:mm:ssZ")
+
+    subtask_delete = subparsers.add_parser("subtask-delete", help="Delete a subtask")
+    subtask_delete.add_argument("--project-id", required=True)
+    subtask_delete.add_argument("--task-id", required=True)
+    subtask_delete.add_argument("--subtask-id", required=True)
 
     return parser
 
@@ -711,6 +901,8 @@ def run(args: argparse.Namespace) -> None:
         command_project_delete(args, region, token_path)
     elif args.command == "tasks":
         command_tasks(args, region, token_path)
+    elif args.command == "task-get":
+        command_task_get(args, region, token_path)
     elif args.command == "task-create":
         command_task_create(args, region, token_path)
     elif args.command == "task-update":
@@ -719,6 +911,14 @@ def run(args: argparse.Namespace) -> None:
         command_task_complete(args, region, token_path)
     elif args.command == "task-delete":
         command_task_delete(args, region, token_path)
+    elif args.command == "subtask-add":
+        command_subtask_add(args, region, token_path)
+    elif args.command == "subtask-update":
+        command_subtask_update(args, region, token_path)
+    elif args.command == "subtask-complete":
+        command_subtask_complete(args, region, token_path)
+    elif args.command == "subtask-delete":
+        command_subtask_delete(args, region, token_path)
     else:
         raise CliError(f"Unsupported command: {args.command}")
 
