@@ -9,6 +9,26 @@ description: Manage Dida365/TickTick tasks and projects from cloud-hosted OpenCl
 
 Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the bundled script for OAuth authorization URL generation, callback exchange, token refresh, task/project CRUD, and parent-task/subtask operations.
 
+## Smart Execution Rules
+
+1. For create requests, prefer direct execution. If the user names a project, resolve it with `project-find`; if no project is given, default to `inbox`.
+2. For update, complete, delete, or move requests, first resolve identity. Use `task-get` when the user provides IDs; otherwise use `task-find` and narrow by project when possible.
+3. If `task-find` returns one strong match (`exact` or a clearly dominant `prefix` match), proceed without asking. If multiple plausible matches remain, ask one short clarification.
+4. Before `task-update`, fetch the current task and preserve unspecified fields. Only change the fields the user asked to change.
+5. For checklist-style requests, treat the parent task as the main task and subtasks as `items`. Use `task-create --subtask ...` on creation and `subtask-*` commands for later edits.
+6. For reporting or smart selection requests like "show overdue/high priority/completed last week", prefer `tasks-filter` or `tasks-completed` before falling back to full project scans.
+7. Never invent due dates, priorities, or project names unless the user implied them clearly. If urgency is explicit, map priority as low=`1`, medium=`3`, high=`5`.
+8. When a task title is ambiguous across projects, prefer the project mentioned by the user. If none is mentioned, return the smallest matching set and ask for disambiguation only if needed.
+
+## Common Intent Mapping
+
+- "Create a task": resolve project, then `task-create`
+- "Update/rename a task": `task-find` -> `task-get` -> `task-update`
+- "Mark a task done": `task-find` -> `task-complete`
+- "Delete a task": `task-find` -> `task-delete`
+- "Add or edit subtasks": `task-find` -> `task-get` -> `subtask-*`
+- "Move tasks between projects": resolve both projects, resolve tasks, then `task-move`
+
 ## Quick Start (Cloud OAuth)
 
 1. Set environment variables in your cloud runtime:
@@ -37,13 +57,13 @@ Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the b
 
 ## Command Workflow
 
-1. Use `projects` first to obtain reliable `projectId`.
-2. Use `tasks --project-id <id>` to fetch current tasks.
+1. Use `project-find` when the user gives a project name rather than an ID.
+2. Use `task-find` when the user gives a task title rather than an ID.
 3. Use `project-get` and `project-update` when you need exact project metadata edits.
 4. Use `task-create`, `task-update`, `task-complete`, `task-delete` for lifecycle actions.
 5. Use `task-get` and `subtask-*` commands to manage parent-task/subtask structures.
 6. Use `task-move`, `tasks-filter`, and `tasks-completed` for bulk or reporting workflows.
-7. Prefer passing `projectId + taskId` directly for deterministic updates.
+7. Prefer passing `projectId + taskId` directly when already known.
 8. Use `token-status --auto-refresh` before long task batches.
 
 ## Core Commands
@@ -56,6 +76,7 @@ python {baseDir}/scripts/ticktick_openclaw.py token-status --auto-refresh
 
 # Projects
 python {baseDir}/scripts/ticktick_openclaw.py projects
+python {baseDir}/scripts/ticktick_openclaw.py project-find --name "Work"
 python {baseDir}/scripts/ticktick_openclaw.py project-create --name "Work"
 python {baseDir}/scripts/ticktick_openclaw.py project-get --project-id "<project_id>"
 python {baseDir}/scripts/ticktick_openclaw.py project-update --project-id "<project_id>" --name "Work Ops" --view-mode kanban
@@ -63,6 +84,7 @@ python {baseDir}/scripts/ticktick_openclaw.py project-delete --project-id "<proj
 
 # Tasks
 python {baseDir}/scripts/ticktick_openclaw.py tasks --project-id "<project_id>"
+python {baseDir}/scripts/ticktick_openclaw.py task-find --title "Prepare proposal" --project-id "<project_id>"
 python {baseDir}/scripts/ticktick_openclaw.py task-create --title "Prepare proposal" --project-id "<project_id>" --priority 5 --subtask "Draft" --subtask "Review"
 python {baseDir}/scripts/ticktick_openclaw.py task-get --task-id "<task_id>" --project-id "<project_id>"
 python {baseDir}/scripts/ticktick_openclaw.py task-update --task-id "<task_id>" --project-id "<project_id>" --title "Updated title"

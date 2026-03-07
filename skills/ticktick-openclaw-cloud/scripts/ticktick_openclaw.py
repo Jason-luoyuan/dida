@@ -346,6 +346,31 @@ def parse_csv_ints(value: str | None) -> list[int]:
     return parsed
 
 
+def normalize_match_text(value: str | None) -> str:
+    if not value:
+        return ""
+    return " ".join(value.casefold().split())
+
+
+def classify_match(query: str, candidate: str) -> str | None:
+    normalized_query = normalize_match_text(query)
+    normalized_candidate = normalize_match_text(candidate)
+    if not normalized_query or not normalized_candidate:
+        return None
+    if normalized_query == normalized_candidate:
+        return "exact"
+    if normalized_candidate.startswith(normalized_query):
+        return "prefix"
+    if normalized_query in normalized_candidate:
+        return "contains"
+    return None
+
+
+def match_rank(match_type: str) -> int:
+    order = {"exact": 0, "prefix": 1, "contains": 2}
+    return order.get(match_type, 99)
+
+
 def fetch_task(args: argparse.Namespace, region: RegionConfig, token_path: Path, project_id: str, task_id: str) -> dict[str, Any]:
     response = api_request(args, region, token_path, "GET", f"/project/{project_id}/task/{task_id}")
     if not isinstance(response, dict):
@@ -518,6 +543,25 @@ def command_projects(args: argparse.Namespace, region: RegionConfig, token_path:
     response = api_request(args, region, token_path, "GET", "/project")
     projects = response if isinstance(response, list) else []
     emit({"ok": True, "count": len(projects), "projects": projects})
+
+
+def command_project_find(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    response = api_request(args, region, token_path, "GET", "/project")
+    projects = response if isinstance(response, list) else []
+    matches: list[dict[str, Any]] = []
+    for project in projects:
+        if not isinstance(project, dict):
+            continue
+        name = str(project.get("name", ""))
+        match_type = classify_match(args.name, name)
+        if match_type is None:
+            continue
+        project_copy = dict(project)
+        project_copy["matchType"] = match_type
+        matches.append(project_copy)
+
+    matches.sort(key=lambda item: (match_rank(str(item.get("matchType", ""))), str(item.get("name", "")).casefold()))
+    emit({"ok": True, "query": args.name, "count": len(matches), "projects": matches})
 
 
 def command_project_get(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
@@ -710,6 +754,53 @@ def command_task_get(args: argparse.Namespace, region: RegionConfig, token_path:
     emit({"ok": True, "task": task, "subtask_count": subtask_count})
 
 
+def command_task_find(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    project_map: dict[str, str] = {}
+    projects_response = api_request(args, region, token_path, "GET", "/project")
+    projects = projects_response if isinstance(projects_response, list) else []
+    project_ids: list[str] = []
+
+    for project in projects:
+        if not isinstance(project, dict):
+            continue
+        project_id = project.get("id")
+        if not isinstance(project_id, str) or not project_id:
+            continue
+        project_map[project_id] = str(project.get("name", ""))
+        if project.get("closed") and not args.include_closed_projects:
+            continue
+        if args.project_id and project_id != args.project_id:
+            continue
+        project_ids.append(project_id)
+
+    matches: list[dict[str, Any]] = []
+    for project_id in project_ids:
+        data = api_request(args, region, token_path, "GET", f"/project/{project_id}/data")
+        tasks = data.get("tasks", []) if isinstance(data, dict) else []
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            if task.get("status") == 2 and not args.include_completed:
+                continue
+            title = str(task.get("title", ""))
+            match_type = classify_match(args.title, title)
+            if match_type is None:
+                continue
+            task_copy = dict(task)
+            task_copy["matchType"] = match_type
+            task_copy["projectName"] = project_map.get(project_id, "")
+            matches.append(task_copy)
+
+    matches.sort(key=lambda item: (
+        match_rank(str(item.get("matchType", ""))),
+        str(item.get("projectName", "")).casefold(),
+        str(item.get("title", "")).casefold(),
+    ))
+    if args.limit and args.limit > 0:
+        matches = matches[: args.limit]
+    emit({"ok": True, "query": args.title, "count": len(matches), "tasks": matches})
+
+
 def command_task_move(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
     payload = [
         {
@@ -883,6 +974,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("projects", help="List projects")
 
+    project_find = subparsers.add_parser("project-find", help="Find project by name")
+    project_find.add_argument("--name", required=True)
+
     project_get = subparsers.add_parser("project-get", help="Get project by id")
     project_get.add_argument("--project-id", required=True)
 
@@ -909,6 +1003,13 @@ def build_parser() -> argparse.ArgumentParser:
     tasks.add_argument("--include-completed", action="store_true")
     tasks.add_argument("--include-closed-projects", action="store_true")
     tasks.add_argument("--limit", type=int, default=0)
+
+    task_find = subparsers.add_parser("task-find", help="Find tasks by title")
+    task_find.add_argument("--title", required=True)
+    task_find.add_argument("--project-id")
+    task_find.add_argument("--include-completed", action="store_true")
+    task_find.add_argument("--include-closed-projects", action="store_true")
+    task_find.add_argument("--limit", type=int, default=20)
 
     task_get = subparsers.add_parser("task-get", help="Get task by project and task id")
     task_get.add_argument("--project-id", required=True)
@@ -1019,6 +1120,8 @@ def run(args: argparse.Namespace) -> None:
         command_token_status(args, region, token_path)
     elif args.command == "projects":
         command_projects(args, region, token_path)
+    elif args.command == "project-find":
+        command_project_find(args, region, token_path)
     elif args.command == "project-get":
         command_project_get(args, region, token_path)
     elif args.command == "project-create":
@@ -1029,6 +1132,8 @@ def run(args: argparse.Namespace) -> None:
         command_project_delete(args, region, token_path)
     elif args.command == "tasks":
         command_tasks(args, region, token_path)
+    elif args.command == "task-find":
+        command_task_find(args, region, token_path)
     elif args.command == "task-get":
         command_task_get(args, region, token_path)
     elif args.command == "task-create":

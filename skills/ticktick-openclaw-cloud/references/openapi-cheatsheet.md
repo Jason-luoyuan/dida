@@ -39,6 +39,7 @@ Token refresh endpoint:
 
 Current script coverage:
 - `projects`
+- `project-find`
 - `project-get`
 - `project-create`
 - `project-update`
@@ -57,6 +58,7 @@ Current script coverage:
 
 Current script coverage:
 - `tasks`
+- `task-find`
 - `task-get`
 - `task-create`
 - `task-update`
