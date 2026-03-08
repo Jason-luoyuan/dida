@@ -7,7 +7,7 @@ description: Manage Dida365/TickTick tasks and projects from cloud-hosted OpenCl
 
 ## Overview
 
-Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the bundled script for OAuth authorization URL generation, callback exchange, token refresh, task/project CRUD, smart name-based resolution, broader task search, natural-language date parsing, schedule analysis, conflict-aware rebalancing, due-date views, batch creation, and parent-task/subtask operations.
+Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the bundled script for deployment self-checks, OAuth authorization URL generation, callback exchange, token refresh, task/project CRUD, smart name-based resolution, broader task search, natural-language date parsing, schedule analysis, conflict-aware rebalancing, due-date views, batch creation, and parent-task/subtask operations.
 
 ## Smart Execution Rules
 
@@ -16,14 +16,15 @@ Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the b
 3. Use `task-find` for title-only resolution. Use `task-search` when the user references task content, descriptions, subtasks, tags, or project text.
 4. If a single exact match exists, proceed. If one match clearly outranks the rest, proceed. If multiple plausible matches remain, ask one short clarification.
 5. For date-oriented requests like "today", "tomorrow", "this week", or "overdue", prefer `tasks-due`. For focus-oriented requests like "engaged" or "next", prefer `tasks-focus`.
-6. For requests to review all active tasks, detect schedule conflicts, evaluate plan quality, or summarize what is coming next, prefer `schedule-analyze`.
-7. For requests like "I cannot do these tasks now", "I am busy until 5pm", "I am already working on something else", or "please push the later tasks back", prefer `schedule-rebalance` first without `--apply`, then repeat with `--apply` only after the new plan is acceptable or the user explicitly asks to commit it.
-8. Date fields on task/subtask creation and updates accept explicit TickTick format and common natural phrases like `明天下午3点`, `下周一上午9点`, `tomorrow 3pm`, or `2026-03-10 18:30`.
-9. For batch creation requests, use `tasks-batch-create` with a JSON array instead of looping one task at a time.
-10. For checklist-style requests, treat the parent task as the main task and subtasks as `items`. Use `task-create --subtask ...` when creating a parent task. For existing parent tasks without IDs, use `subtask-find` and `subtask-smart-*`.
-11. Before `task-update` or `task-smart-update`, change only the fields the user explicitly asked to change.
-12. Never invent due dates, priorities, or project names unless the user implied them clearly. If urgency is explicit, map priority as low=`1`, medium=`3`, high=`5`.
-13. When a task title is ambiguous across projects, prefer the project mentioned by the user. If none is mentioned, return the smallest matching set and ask only if needed.
+6. For first-time setup, cloud deployment troubleshooting, token-path checks, or permission checks, prefer `doctor` before touching the API.
+7. For requests to review all active tasks, detect schedule conflicts, evaluate plan quality, or summarize what is coming next, prefer `schedule-analyze`.
+8. For requests like "I cannot do these tasks now", "I am busy until 5pm", "I am already working on something else", or "please push the later tasks back", prefer `schedule-rebalance` first without `--apply`, then repeat with `--apply` only after the new plan is acceptable or the user explicitly asks to commit it.
+9. Date fields on task/subtask creation and updates accept explicit TickTick format and common natural phrases like `明天下午3点`, `下周一上午9点`, `tomorrow 3pm`, or `2026-03-10 18:30`.
+10. For batch creation requests, use `tasks-batch-create` with a JSON array instead of looping one task at a time.
+11. For checklist-style requests, treat the parent task as the main task and subtasks as `items`. Use `task-create --subtask ...` when creating a parent task. For existing parent tasks without IDs, use `subtask-find` and `subtask-smart-*`.
+12. Before `task-update` or `task-smart-update`, change only the fields the user explicitly asked to change.
+13. Never invent due dates, priorities, or project names unless the user implied them clearly. If urgency is explicit, map priority as low=`1`, medium=`3`, high=`5`.
+14. When a task title is ambiguous across projects, prefer the project mentioned by the user. If none is mentioned, return the smallest matching set and ask only if needed.
 
 ## Common Intent Mapping
 
@@ -34,6 +35,7 @@ Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the b
 - "Search tasks by note/content/subtask": `task-search`
 - "Show due today / overdue / this week": `tasks-due`
 - "Show engaged / next tasks": `tasks-focus`
+- "Check deployment, env vars, and token storage": `doctor`
 - "Extract all tasks as a schedule": `schedule-analyze`
 - "I am blocked / busy / doing something else": `schedule-rebalance`
 - "Optimize today's or this week's arrangement": `schedule-analyze`, then `schedule-rebalance`
@@ -48,20 +50,26 @@ Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the b
    - `TICKTICK_CLIENT_SECRET`
    - `TICKTICK_REDIRECT_URI`
    - Optional: `TICKTICK_REGION` (`dida` default, or `ticktick`)
-2. Generate an authorization URL:
+   - Recommended for persistent cloud storage: `TICKTICK_TOKEN_PATH`
+   - Recommended for persistent cloud storage: `TICKTICK_STATE_PATH`
+2. Run a deployment self-check:
+   ```bash
+   python {baseDir}/scripts/ticktick_openclaw.py doctor
+   ```
+3. Generate an authorization URL:
    ```bash
    python {baseDir}/scripts/ticktick_openclaw.py auth-url
    ```
-3. Open that URL locally, approve access, and copy the full callback URL.
-4. Exchange callback URL for token:
+4. Open that URL locally, approve access, and copy the full callback URL.
+5. Exchange callback URL for token:
    ```bash
    python {baseDir}/scripts/ticktick_openclaw.py auth-exchange --callback-url "https://your.redirect/callback?code=...&state=..."
    ```
-5. Verify token status:
+6. Verify token status:
    ```bash
    python {baseDir}/scripts/ticktick_openclaw.py token-status --auto-refresh
    ```
-6. Start task management:
+7. Start task management:
    ```bash
    python {baseDir}/scripts/ticktick_openclaw.py projects
    python {baseDir}/scripts/ticktick_openclaw.py task-create --title "Prepare weekly report" --project-name "Work" --priority 3
@@ -76,15 +84,18 @@ Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the b
 5. Use `task-get` and `subtask-*` commands when IDs are already known.
 6. Use `subtask-find` and `subtask-smart-*` when the user references parent/subtask titles instead of IDs.
 7. Use `tasks-due`, `tasks-focus`, `tasks-filter`, and `tasks-completed` for reporting or review workflows.
-8. Use `schedule-analyze` before any large-scale planning discussion so the model sees normalized task timing, conflicts, and risk flags in one JSON response.
-9. Use `schedule-rebalance` for blocked-time or cascading-reschedule requests. Prefer a dry run first, inspect `proposals`, then rerun with `--apply` to commit the shifts.
-10. Use `tasks-batch-create` when the user provides multiple tasks in one turn.
-11. Use `token-status --auto-refresh` before long task batches or schedule-wide adjustments.
+8. Use `doctor` before first auth and after infrastructure changes to confirm env vars, token path, state path, and optional API connectivity.
+9. Use `schedule-analyze` before any large-scale planning discussion so the model sees normalized task timing, conflicts, and risk flags in one JSON response.
+10. Use `schedule-rebalance` for blocked-time or cascading-reschedule requests. Prefer a dry run first, inspect `proposals`, then rerun with `--apply` to commit the shifts.
+11. Use `tasks-batch-create` when the user provides multiple tasks in one turn.
+12. Use `token-status --auto-refresh` before long task batches or schedule-wide adjustments.
 
 ## Core Commands
 
 ```bash
-# Auth
+# Auth / Deployment
+python {baseDir}/scripts/ticktick_openclaw.py doctor
+python {baseDir}/scripts/ticktick_openclaw.py doctor --check-api --auto-refresh
 python {baseDir}/scripts/ticktick_openclaw.py auth-url
 python {baseDir}/scripts/ticktick_openclaw.py auth-exchange --callback-url "<callback_url>"
 python {baseDir}/scripts/ticktick_openclaw.py token-status --auto-refresh
@@ -132,6 +143,7 @@ python {baseDir}/scripts/ticktick_openclaw.py subtask-smart-delete --parent-task
 - Subtasks map to the official `items` field in task objects.
 - `schedule-analyze` and `schedule-rebalance` accept repeated `--busy-window "start/end"` blocks; both sides can use natural-language dates and times.
 - `schedule-rebalance --task-query ...` limits moves to matching tasks, while `--protect-task-title ...` keeps selected tasks fixed.
+- `doctor` checks env vars, token/state paths, token file health, and optionally `GET /project` when `--check-api` is provided.
 - Script outputs JSON by default for agent-safe parsing.
 
 ## Reliability Rules
@@ -140,7 +152,8 @@ python {baseDir}/scripts/ticktick_openclaw.py subtask-smart-delete --parent-task
 2. Use `dida` region for Dida365 accounts and `ticktick` for TickTick accounts.
 3. If callback exchange fails with state mismatch, regenerate URL via `auth-url`.
 4. If refresh fails, re-run `auth-url` + `auth-exchange`.
-5. `task-search`, `tasks-due`, `tasks-focus`, `schedule-analyze`, `schedule-rebalance`, `tasks-batch-create`, and all `*-smart-*` commands are convenience wrappers over the official endpoints already documented in `references/openapi-cheatsheet.md`.
+5. `doctor` is a local deployment diagnostic and does not call vendor APIs unless `--check-api` is requested.
+6. `task-search`, `tasks-due`, `tasks-focus`, `schedule-analyze`, `schedule-rebalance`, `tasks-batch-create`, and all `*-smart-*` commands are convenience wrappers over the official endpoints already documented in `references/openapi-cheatsheet.md`.
 
 ## References
 

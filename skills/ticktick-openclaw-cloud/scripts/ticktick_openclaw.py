@@ -238,6 +238,84 @@ def token_expiry_epoch(token_data: dict[str, Any]) -> float | None:
     return None
 
 
+
+
+def value_source(flag_value: str | None, env_name: str) -> str:
+    if flag_value:
+        return 'flag'
+    if os.getenv(env_name):
+        return 'env'
+    return 'default'
+
+
+def probe_writable_directory(path: Path) -> tuple[bool, str | None]:
+    probe_file: Path | None = None
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe_file = path / f'.write-test-{secrets.token_hex(6)}'
+        with probe_file.open('w', encoding='utf-8') as handle:
+            handle.write('ok\n')
+        probe_file.unlink()
+        return True, None
+    except OSError as exc:
+        if probe_file and probe_file.exists():
+            try:
+                probe_file.unlink()
+            except OSError:
+                pass
+        return False, str(exc)
+
+
+def build_path_diagnostic(path: Path, source: str) -> dict[str, Any]:
+    writable, write_error = probe_writable_directory(path.parent)
+    return {
+        'path': str(path),
+        'source': source,
+        'exists': path.exists(),
+        'parentPath': str(path.parent),
+        'parentExists': path.parent.exists(),
+        'parentWritable': writable,
+        'writeError': write_error,
+    }
+
+
+def inspect_token_file(token_path: Path, region: RegionConfig) -> dict[str, Any]:
+    info: dict[str, Any] = {
+        'path': str(token_path),
+        'exists': token_path.exists(),
+        'valid': False,
+        'hasAccessToken': False,
+        'hasRefreshToken': False,
+        'regionMatchesCommand': None,
+        'expiresAt': None,
+        'secondsRemaining': None,
+        'needsRefresh': None,
+        'error': None,
+    }
+    if not token_path.exists():
+        return info
+
+    try:
+        token_data = ensure_token_file(token_path)
+    except CliError as exc:
+        info['error'] = str(exc)
+        return info
+
+    info['valid'] = True
+    info['hasAccessToken'] = bool(token_data.get('access_token'))
+    info['hasRefreshToken'] = bool(token_data.get('refresh_token'))
+    token_region = token_data.get('region')
+    info['tokenRegion'] = token_region
+    info['regionMatchesCommand'] = not token_region or token_region == region.name
+    expires_at = token_expiry_epoch(token_data)
+    if isinstance(expires_at, float):
+        info['expiresAt'] = datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat()
+        info['secondsRemaining'] = int(expires_at - time.time())
+    info['needsRefresh'] = should_refresh_token(token_data)
+    info['scope'] = token_data.get('scope')
+    info['obtainedAt'] = token_data.get('obtained_at')
+    return info
+
 def ensure_token_file(token_path: Path) -> dict[str, Any]:
     token = read_json(token_path)
     if token is None:
@@ -1734,6 +1812,100 @@ def command_auth_exchange(
     )
 
 
+
+
+def command_doctor(
+    args: argparse.Namespace,
+    region: RegionConfig,
+    token_path: Path,
+    state_path: Path,
+) -> None:
+    client_id = getattr(args, 'client_id', None) or os.getenv('TICKTICK_CLIENT_ID')
+    client_secret = getattr(args, 'client_secret', None) or os.getenv('TICKTICK_CLIENT_SECRET')
+    redirect_uri = getattr(args, 'redirect_uri', None) or os.getenv('TICKTICK_REDIRECT_URI')
+
+    token_source = value_source(getattr(args, 'token_path', None), 'TICKTICK_TOKEN_PATH')
+    state_source = value_source(getattr(args, 'state_path', None), 'TICKTICK_STATE_PATH')
+    region_source = value_source(getattr(args, 'region', None), 'TICKTICK_REGION')
+
+    token_path_info = build_path_diagnostic(token_path, token_source)
+    state_path_info = build_path_diagnostic(state_path, state_source)
+    token_info = inspect_token_file(token_path, region)
+
+    issues: list[str] = []
+    recommendations: list[str] = []
+
+    if not client_id:
+        issues.append('Missing TICKTICK_CLIENT_ID or --client-id.')
+    if not client_secret:
+        issues.append('Missing TICKTICK_CLIENT_SECRET or --client-secret.')
+    if not redirect_uri:
+        issues.append('Missing TICKTICK_REDIRECT_URI or --redirect-uri.')
+    if not token_path_info['parentWritable']:
+        issues.append(f"Token directory is not writable: {token_path_info['parentPath']}")
+    if not state_path_info['parentWritable']:
+        issues.append(f"State directory is not writable: {state_path_info['parentPath']}")
+    if not token_info['exists']:
+        issues.append('Token file does not exist yet. Run auth-url and auth-exchange.')
+    elif not token_info['valid']:
+        issues.append(token_info['error'] or 'Token file is invalid.')
+    elif token_info['regionMatchesCommand'] is False:
+        issues.append(
+            f"Token region '{token_info.get('tokenRegion')}' does not match command region '{region.name}'."
+        )
+
+    if token_source == 'default':
+        recommendations.append(
+            'If your cloud deployment has a dedicated persistent volume, set TICKTICK_TOKEN_PATH explicitly to that path.'
+        )
+    if state_source == 'default':
+        recommendations.append(
+            'Set TICKTICK_STATE_PATH explicitly if you want OAuth state files stored beside your persistent token path.'
+        )
+    if token_info['exists'] and token_info['valid'] and token_info['needsRefresh']:
+        recommendations.append('Token is near expiry. Run token-status --auto-refresh or re-authenticate if refresh fails.')
+    if not token_info['exists'] and client_id and client_secret and redirect_uri:
+        recommendations.append('Credential variables are present. Next step: run auth-url, approve access, then run auth-exchange.')
+
+    api_check: dict[str, Any] | None = None
+    if args.check_api:
+        api_check = {'attempted': True, 'ok': False, 'autoRefresh': bool(args.auto_refresh)}
+        try:
+            token_data = get_access_token(args, region, token_path, allow_refresh=args.auto_refresh)
+            projects = api_request(args, region, token_path, 'GET', '/project')
+            api_check['ok'] = True
+            api_check['tokenRegion'] = token_data.get('region')
+            api_check['projectCount'] = len(projects) if isinstance(projects, list) else None
+        except CliError as exc:
+            api_check['error'] = str(exc)
+            issues.append(f"API check failed: {exc}")
+
+    emit(
+        {
+            'ok': len(issues) == 0,
+            'region': region.name,
+            'regionSource': region_source,
+            'pythonVersion': sys.version.split()[0],
+            'homePath': str(Path.home()),
+            'environment': {
+                'clientIdPresent': bool(client_id),
+                'clientIdSource': value_source(getattr(args, 'client_id', None), 'TICKTICK_CLIENT_ID'),
+                'clientSecretPresent': bool(client_secret),
+                'clientSecretSource': value_source(getattr(args, 'client_secret', None), 'TICKTICK_CLIENT_SECRET'),
+                'redirectUriPresent': bool(redirect_uri),
+                'redirectUriSource': value_source(getattr(args, 'redirect_uri', None), 'TICKTICK_REDIRECT_URI'),
+            },
+            'paths': {
+                'token': token_path_info,
+                'state': state_path_info,
+            },
+            'token': token_info,
+            'apiCheck': api_check,
+            'issues': issues,
+            'recommendations': recommendations,
+        }
+    )
+
 def command_token_status(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
     token_data = get_access_token(args, region, token_path, allow_refresh=args.auto_refresh)
     expires_at = token_expiry_epoch(token_data)
@@ -2820,6 +2992,11 @@ def build_parser() -> argparse.ArgumentParser:
     token_status = subparsers.add_parser("token-status", help="Inspect token and optionally refresh")
     token_status.add_argument("--auto-refresh", action="store_true")
 
+
+    doctor = subparsers.add_parser('doctor', help='Check cloud deployment prerequisites and token storage')
+    doctor.add_argument('--check-api', action='store_true', help='Also call GET /project using the current token')
+    doctor.add_argument('--auto-refresh', action='store_true', help='Allow token refresh during --check-api')
+
     subparsers.add_parser("projects", help="List projects")
 
     project_find = subparsers.add_parser("project-find", help="Find project by name")
@@ -3121,6 +3298,8 @@ def run(args: argparse.Namespace) -> None:
         command_auth_exchange(args, region, token_path, state_path)
     elif args.command == "token-status":
         command_token_status(args, region, token_path)
+    elif args.command == "doctor":
+        command_doctor(args, region, token_path, state_path)
     elif args.command == "projects":
         command_projects(args, region, token_path)
     elif args.command == "project-find":

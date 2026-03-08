@@ -1,95 +1,119 @@
 # 滴答清单 OpenClaw 云端 Skill
 
-本仓库提供一个可在**云端 OpenClaw** 环境运行的滴答清单（Dida365 / TickTick）技能：
+这个仓库提供一个适合云端 OpenClaw 的 Dida365 / TickTick skill，核心目录是 `skills/ticktick-openclaw-cloud`。
 
-- 技能目录：`skills/ticktick-openclaw-cloud`
-- 核心脚本：`skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py`
-- 特点：云端无本地回调服务场景可用、支持 OAuth 手动回调、Token 自动刷新、任务与项目管理（JSON 输出）
+## 主要能力
 
-## 目录结构
+- 云端可用的 headless OAuth 授权
+- Token 自动刷新
+- 项目与任务 CRUD
+- 智能任务查找、更新、完成、删除
+- 父任务 / 子任务管理
+- 自然语言时间解析
+- 排期分析与冲突重排
+- 部署自检命令 `doctor`
 
-```text
-skills/ticktick-openclaw-cloud/
-├─ SKILL.md
-├─ agents/openai.yaml
-├─ scripts/ticktick_openclaw.py
-└─ references/
-   ├─ openapi-cheatsheet.md
-   └─ research-notes.md
-```
+## 推荐的云端环境变量
 
-## 快速开始（云端部署）
-
-### 1) 准备环境变量
-
-在云端 OpenClaw 运行环境中配置：
+请在你的 OpenClaw 运行环境中配置：
 
 - `TICKTICK_CLIENT_ID`
 - `TICKTICK_CLIENT_SECRET`
 - `TICKTICK_REDIRECT_URI`
-- 可选：`TICKTICK_REGION`（`dida` 或 `ticktick`，默认 `dida`）
+- `TICKTICK_REGION`（可选，`dida` 或 `ticktick`，默认 `dida`）
+- `TICKTICK_TOKEN_PATH`（强烈建议，指向持久化目录）
+- `TICKTICK_STATE_PATH`（强烈建议，指向持久化目录）
 
-### 2) 生成授权链接
+示例：
 
-```bash
-python skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py auth-url
+```env
+TICKTICK_REGION=dida
+TICKTICK_CLIENT_ID=your_client_id
+TICKTICK_CLIENT_SECRET=your_client_secret
+TICKTICK_REDIRECT_URI=https://your-domain.example.com/ticktick/callback
+TICKTICK_TOKEN_PATH=/data/openclaw/ticktick-openclaw-cloud/token.json
+TICKTICK_STATE_PATH=/data/openclaw/ticktick-openclaw-cloud/oauth_state.json
 ```
 
-### 3) 浏览器授权并回传 callback URL
+## 部署到 OpenClaw
 
-在本地浏览器打开上一步返回的 `authorization_url`，授权后复制完整回调 URL。
+### 方式一：标准技能目录部署
 
-### 4) 交换 Token
+如果你的 OpenClaw / Codex 兼容实例从 `$CODEX_HOME/skills` 读取技能：
 
 ```bash
-python skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py auth-exchange --callback-url "https://your.redirect/callback?code=...&state=..."
+git clone https://github.com/Jason-luoyuan/dida.git
+mkdir -p "$CODEX_HOME/skills"
+cp -R dida/skills/ticktick-openclaw-cloud "$CODEX_HOME/skills/"
 ```
 
-### 5) 检查 Token 状态（可自动刷新）
+重启 OpenClaw，让它重新加载技能。
+
+### 方式二：工作区内直接挂载
+
+如果你的 OpenClaw 已经把这个仓库挂进工作区，并且会读取工作区内的 `skills/` 目录，那就不需要额外复制，只要保证：
+
+- `skills/ticktick-openclaw-cloud` 存在
+- Python 可执行
+- 上面的环境变量已经注入到 OpenClaw 运行环境
+
+然后重启 OpenClaw。
+
+## 首次上线检查
+
+在 OpenClaw 所在服务器上运行：
 
 ```bash
-python skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py token-status --auto-refresh
+python skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py doctor
+```
+
+如果技能已经安装到 `$CODEX_HOME/skills`，则运行：
+
+```bash
+python "$CODEX_HOME/skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py" doctor
+```
+
+如需连 API 一起检查：
+
+```bash
+python "$CODEX_HOME/skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py" doctor --check-api --auto-refresh
+```
+
+## 首次授权
+
+1. 生成授权链接：
+
+```bash
+python "$CODEX_HOME/skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py" auth-url
+```
+
+2. 在本地浏览器打开返回的 `authorization_url`
+3. 授权后复制完整回调 URL
+4. 交换 token：
+
+```bash
+python "$CODEX_HOME/skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py" auth-exchange --callback-url "https://your-domain.example.com/ticktick/callback?code=...&state=..."
+```
+
+5. 检查 token：
+
+```bash
+python "$CODEX_HOME/skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py" token-status --auto-refresh
 ```
 
 ## 常用命令
 
 ```bash
-# 列项目
-python skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py projects
-
-# 创建项目
-python skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py project-create --name "Work"
-
-# 列某项目任务
-python skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py tasks --project-id "<project_id>"
-
-# 创建任务（默认可用 inbox）
-python skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py task-create --title "Prepare proposal" --project-id "inbox" --priority 3
-
-# 更新任务
-python skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py task-update --task-id "<task_id>" --project-id "<project_id>" --title "Updated title"
-
-# 完成任务
-python skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py task-complete --task-id "<task_id>" --project-id "<project_id>"
-
-# 删除任务
-python skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py task-delete --task-id "<task_id>" --project-id "<project_id>"
+python "$CODEX_HOME/skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py" projects
+python "$CODEX_HOME/skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py" tasks --project-name "Work"
+python "$CODEX_HOME/skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py" task-create --title "准备周报" --project-name "Work" --due-date "明天下午3点"
+python "$CODEX_HOME/skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py" schedule-analyze --days 7
+python "$CODEX_HOME/skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py" schedule-rebalance --current-task-title "线上故障" --current-task-until "今天18:00"
 ```
 
-## 云端运行建议
+## 说明
 
-- 将 token 文件挂载到持久化存储（默认：`~/.openclaw/credentials/ticktick-openclaw-cloud/token.json`）。
-- 建议总是先 `projects` 获取真实 `projectId`，再执行任务增删改。
-- 定时任务/批处理前先执行 `token-status --auto-refresh`。
-
-## 故障排查
-
-- `Missing client id`：检查环境变量或在命令中传 `--client-id`。
-- `Token file not found`：先执行 `auth-url` + `auth-exchange`。
-- `State mismatch`：重新执行 `auth-url` 生成新 state 后再次授权。
-- `Token region is ...`：切换 `--region` 或重新按对应区域授权。
-
-## 安全说明
-
-- 不要在日志中打印 `client_secret`、`access_token`、`refresh_token`。
-- Token 文件应仅允许最小权限访问。
+- 默认 token 路径是运行用户 home 目录下的 `~/.openclaw/credentials/ticktick-openclaw-cloud/token.json`
+- 在云端部署里，仍然建议显式设置 `TICKTICK_TOKEN_PATH` 和 `TICKTICK_STATE_PATH`，这样最清晰
+- 如果你的机器是持久化磁盘，重启后 token 文件会保留
+- 如果未来切换到新的容器或新的实例，记得一起迁移持久化目录
