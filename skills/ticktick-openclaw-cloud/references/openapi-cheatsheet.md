@@ -73,6 +73,8 @@ Current script coverage:
 - `tasks-filter`
 - `tasks-due`
 - `tasks-focus`
+- `schedule-analyze`
+- `schedule-rebalance`
 - `tasks-batch-create`
 - `subtask-add`
 - `subtask-find`
@@ -107,6 +109,8 @@ These commands are wrappers over the official endpoints above, not additional ve
 - `tasks-due`: filters official task data into `today`, `tomorrow`, `this-week`, `overdue`, or `--days N` views.
 - `normalize_user_datetime_value` inside the script converts common ISO and natural phrases like `明天下午3点`, `下周一上午9点`, and `tomorrow 3pm` into TickTick-compatible date strings before API calls.
 - `tasks-focus`: returns `engaged` and `next` task sets inspired by GTD-style review workflows.
+- `schedule-analyze`: pulls official task/project data, normalizes timing, and returns a schedule-oriented JSON view with conflicts and risks.
+- `schedule-rebalance`: proposes or applies rescheduling by combining official task data with local conflict-detection and blocked-time heuristics.
 - `tasks-batch-create`: loops official `POST /task` calls from a JSON array.
 - `subtask-find` and `subtask-smart-*`: resolve parent task/subtask titles, then update the official `items` field on the parent task.
 

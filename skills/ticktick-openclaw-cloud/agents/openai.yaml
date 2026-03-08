@@ -1,4 +1,4 @@
 interface:
   display_name: "TickTick OpenClaw Cloud"
-  short_description: "Manage TickTick/Dida tasks in cloud OpenClaw"
-  default_prompt: "Use $ticktick-openclaw-cloud to authenticate Dida/TickTick and manage my tasks/projects in this cloud workspace."
+  short_description: "Manage and rebalance TickTick/Dida tasks in cloud OpenClaw"
+  default_prompt: "Use $ticktick-openclaw-cloud to authenticate Dida/TickTick, manage my tasks/projects, review my schedule, and rebalance conflicts in this cloud workspace."

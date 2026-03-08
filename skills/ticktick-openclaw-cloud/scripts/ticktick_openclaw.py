@@ -28,6 +28,31 @@ class RegionConfig:
     api_base: str
 
 
+@dataclass(frozen=True)
+class BusyWindow:
+    label: str
+    start: datetime
+    end: datetime
+    source: str
+
+
+@dataclass
+class ScheduleEntry:
+    task: dict[str, Any]
+    task_id: str
+    project_id: str
+    project_name: str
+    title: str
+    start: datetime | None
+    end: datetime | None
+    deadline: datetime | None
+    time_zone: str
+    schedule_type: str
+    duration_minutes: int | None
+    priority: int
+    all_day: bool
+
+
 REGIONS = {
     "dida": RegionConfig(
         name="dida",
@@ -664,6 +689,492 @@ def normalize_user_datetime_value(raw_value: str | None, explicit_time_zone: str
         return natural
     return raw_value
 
+
+
+
+def parse_schedule_datetime(
+    raw_value: str | None,
+    explicit_time_zone: str | None = None,
+    treat_date_only_as_end: bool = False,
+) -> datetime | None:
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip()
+    if not text:
+        return None
+    parsed = parse_ticktick_datetime(text)
+    if parsed is None:
+        return None
+
+    zone = resolve_time_zone(explicit_time_zone)
+    if len(text) <= 10:
+        local_value = datetime(parsed.year, parsed.month, parsed.day, tzinfo=zone)
+        if treat_date_only_as_end:
+            local_value += timedelta(days=1)
+        return local_value.astimezone(timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=zone)
+    return parsed.astimezone(timezone.utc)
+
+
+def format_schedule_datetime(value: datetime | None, explicit_time_zone: str | None = None) -> str | None:
+    if value is None:
+        return None
+    zone = resolve_time_zone(explicit_time_zone)
+    return format_ticktick_datetime(value.astimezone(zone))
+
+
+def serialize_task_datetime(
+    raw_value: str | None,
+    parsed_value: datetime | None,
+    explicit_time_zone: str | None = None,
+    all_day: bool = False,
+) -> str | None:
+    text = str(raw_value or '').strip()
+    if not text:
+        return None
+    if all_day or len(text) <= 10:
+        return text
+    if parsed_value is None:
+        return text
+    return format_schedule_datetime(parsed_value, explicit_time_zone)
+
+
+def resolve_reference_time(raw_value: str | None, explicit_time_zone: str | None = None) -> datetime:
+    if raw_value is None or not str(raw_value).strip():
+        return now_utc()
+
+    normalized = str(raw_value).strip().casefold()
+    if normalized in {'now', '现在', '此刻'}:
+        return now_utc()
+
+    normalized_value = normalize_user_datetime_value(str(raw_value), explicit_time_zone)
+    parsed = parse_schedule_datetime(normalized_value, explicit_time_zone)
+    if parsed is None:
+        raise CliError(f"Invalid reference time '{raw_value}'.")
+    return parsed
+
+
+def parse_busy_window(raw_value: str, explicit_time_zone: str | None, label: str) -> BusyWindow:
+    if '/' not in raw_value:
+        raise CliError("Busy windows must use 'start/end'.")
+    start_raw, end_raw = raw_value.split('/', 1)
+    start_normalized = normalize_user_datetime_value(start_raw, explicit_time_zone)
+    end_normalized = normalize_user_datetime_value(end_raw, explicit_time_zone)
+    start = parse_schedule_datetime(start_normalized, explicit_time_zone)
+    end = parse_schedule_datetime(
+        end_normalized,
+        explicit_time_zone,
+        treat_date_only_as_end=bool(isinstance(end_normalized, str) and len(end_normalized) <= 10),
+    )
+    if start is None or end is None:
+        raise CliError(f"Invalid busy window '{raw_value}'.")
+    if end <= start:
+        raise CliError(f"Busy window end must be after start in '{raw_value}'.")
+    return BusyWindow(label=label, start=start, end=end, source='busy-window')
+
+
+def serialize_busy_window(window: BusyWindow, explicit_time_zone: str | None = None) -> dict[str, Any]:
+    return {
+        'label': window.label,
+        'source': window.source,
+        'startAt': format_schedule_datetime(window.start, explicit_time_zone),
+        'endAt': format_schedule_datetime(window.end, explicit_time_zone),
+    }
+
+
+def build_busy_windows(args: argparse.Namespace, reference_time: datetime) -> list[BusyWindow]:
+    windows: list[BusyWindow] = []
+    for index, raw_value in enumerate(getattr(args, 'busy_window', []) or [], start=1):
+        windows.append(parse_busy_window(raw_value, getattr(args, 'time_zone', None), f'busy-window-{index}'))
+
+    raw_current_task_title = getattr(args, 'current_task_title', None)
+    current_task_until = getattr(args, 'current_task_until', None)
+    if raw_current_task_title and not current_task_until:
+        raise CliError('Provide --current-task-until when using --current-task-title.')
+    current_task_title = raw_current_task_title or 'current-task'
+    if current_task_until:
+        end = parse_schedule_datetime(
+            normalize_user_datetime_value(current_task_until, getattr(args, 'time_zone', None)),
+            getattr(args, 'time_zone', None),
+        )
+        if end is None:
+            raise CliError(f"Invalid --current-task-until value '{current_task_until}'.")
+        if end <= reference_time:
+            raise CliError('--current-task-until must be after the reference time.')
+        windows.append(BusyWindow(label=current_task_title, start=reference_time, end=end, source='current-task'))
+
+    windows.sort(key=lambda item: (item.start, item.end, item.label))
+    return windows
+
+
+def build_schedule_entry(task: dict[str, Any], default_duration_minutes: int) -> ScheduleEntry:
+    time_zone_name = str(task.get('timeZone') or default_time_zone_name())
+    all_day = is_task_all_day(task)
+    start_raw = str(task.get('startDate') or '')
+    due_raw = str(task.get('dueDate') or '')
+    start = parse_schedule_datetime(start_raw, time_zone_name)
+    end = parse_schedule_datetime(due_raw, time_zone_name, treat_date_only_as_end=all_day)
+
+    if all_day:
+        schedule_type = 'all-day'
+    elif start is not None and end is not None and end > start:
+        schedule_type = 'timed'
+    elif start is not None and end is not None and end <= start:
+        schedule_type = 'invalid'
+    elif start is not None:
+        schedule_type = 'start-only'
+    elif end is not None:
+        schedule_type = 'deadline-only'
+    else:
+        schedule_type = 'unscheduled'
+
+    duration_minutes: int | None = None
+    if schedule_type == 'timed' and start is not None and end is not None:
+        duration_minutes = max(int((end - start).total_seconds() // 60), 1)
+    elif schedule_type == 'start-only':
+        duration_minutes = default_duration_minutes
+
+    return ScheduleEntry(
+        task=task,
+        task_id=str(task.get('id') or ''),
+        project_id=str(task.get('projectId') or ''),
+        project_name=str(task.get('projectName') or ''),
+        title=str(task.get('title') or task.get('id') or '<unknown task>'),
+        start=start,
+        end=end,
+        deadline=end,
+        time_zone=time_zone_name,
+        schedule_type=schedule_type,
+        duration_minutes=duration_minutes,
+        priority=task_priority_value(task),
+        all_day=all_day,
+    )
+
+
+def schedule_entry_sort_key(entry: ScheduleEntry) -> tuple[Any, ...]:
+    marker = entry.start or entry.deadline
+    fallback = datetime.max.replace(tzinfo=timezone.utc)
+    return (marker is None, marker or fallback, -entry.priority, entry.title.casefold(), entry.project_name.casefold())
+
+
+def schedule_entry_within_horizon(entry: ScheduleEntry, reference_time: datetime, days: int | None) -> bool:
+    if days is None:
+        return True
+    marker = entry.start or entry.deadline
+    if marker is None:
+        return True
+    horizon_end = reference_time + timedelta(days=days)
+    return marker <= horizon_end or marker <= reference_time
+
+
+def serialize_schedule_entry(entry: ScheduleEntry, reference_time: datetime) -> dict[str, Any]:
+    task = entry.task
+    subtasks = task.get('items') if isinstance(task.get('items'), list) else []
+    return {
+        'id': entry.task_id,
+        'projectId': entry.project_id,
+        'projectName': entry.project_name,
+        'title': entry.title,
+        'priority': entry.priority,
+        'status': task.get('status'),
+        'scheduleType': entry.schedule_type,
+        'timeZone': entry.time_zone,
+        'isAllDay': entry.all_day,
+        'startAt': serialize_task_datetime(task.get('startDate'), entry.start, entry.time_zone, entry.all_day),
+        'endAt': serialize_task_datetime(task.get('dueDate'), entry.end, entry.time_zone, entry.all_day),
+        'deadlineAt': serialize_task_datetime(task.get('dueDate'), entry.deadline, entry.time_zone, entry.all_day),
+        'durationMinutes': entry.duration_minutes,
+        'isOverdue': is_task_overdue(task, reference_time),
+        'subtaskCount': len([item for item in subtasks if isinstance(item, dict)]),
+        'tags': task.get('tags') if isinstance(task.get('tags'), list) else [],
+        'rawStartDate': task.get('startDate'),
+        'rawDueDate': task.get('dueDate'),
+    }
+
+
+def interval_overlaps(start_a: datetime, end_a: datetime, start_b: datetime, end_b: datetime) -> bool:
+    return start_a < end_b and start_b < end_a
+
+
+def schedule_entry_matches_queries(entry: ScheduleEntry, queries: list[str]) -> bool:
+    if not queries:
+        return True
+    for query in queries:
+        if build_task_search_result(query, entry.task, TASK_SEARCH_FIELDS) is not None:
+            return True
+    return False
+
+
+def schedule_entry_is_protected(entry: ScheduleEntry, protected_titles: list[str]) -> bool:
+    if not protected_titles:
+        return False
+    for title in protected_titles:
+        if classify_match(title, entry.title) is not None:
+            return True
+    return False
+
+
+def build_schedule_analysis(
+    entries: list[ScheduleEntry],
+    busy_windows: list[BusyWindow],
+    reference_time: datetime,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    conflicts: list[dict[str, Any]] = []
+    risks: list[dict[str, Any]] = []
+    timed_entries = [entry for entry in entries if entry.schedule_type == 'timed' and entry.start is not None and entry.end is not None]
+    timed_entries.sort(key=schedule_entry_sort_key)
+
+    for index, entry in enumerate(timed_entries):
+        for other in timed_entries[index + 1:]:
+            if other.start is None or other.end is None:
+                continue
+            if other.start >= entry.end:
+                break
+            if not interval_overlaps(entry.start, entry.end, other.start, other.end):
+                continue
+            overlap_start = max(entry.start, other.start)
+            overlap_end = min(entry.end, other.end)
+            conflicts.append({
+                'type': 'task-overlap',
+                'startAt': format_schedule_datetime(overlap_start, entry.time_zone),
+                'endAt': format_schedule_datetime(overlap_end, entry.time_zone),
+                'tasks': [
+                    {
+                        'id': entry.task_id,
+                        'projectId': entry.project_id,
+                        'projectName': entry.project_name,
+                        'title': entry.title,
+                        'startAt': serialize_task_datetime(entry.task.get('startDate'), entry.start, entry.time_zone, entry.all_day),
+                        'endAt': serialize_task_datetime(entry.task.get('dueDate'), entry.end, entry.time_zone, entry.all_day),
+                    },
+                    {
+                        'id': other.task_id,
+                        'projectId': other.project_id,
+                        'projectName': other.project_name,
+                        'title': other.title,
+                        'startAt': serialize_task_datetime(other.task.get('startDate'), other.start, other.time_zone, other.all_day),
+                        'endAt': serialize_task_datetime(other.task.get('dueDate'), other.end, other.time_zone, other.all_day),
+                    },
+                ],
+            })
+
+    for entry in timed_entries:
+        for window in busy_windows:
+            if not interval_overlaps(entry.start, entry.end, window.start, window.end):
+                continue
+            conflicts.append({
+                'type': 'busy-window-overlap',
+                'label': window.label,
+                'source': window.source,
+                'window': serialize_busy_window(window, entry.time_zone),
+                'task': {
+                    'id': entry.task_id,
+                    'projectId': entry.project_id,
+                    'projectName': entry.project_name,
+                    'title': entry.title,
+                    'startAt': serialize_task_datetime(entry.task.get('startDate'), entry.start, entry.time_zone, entry.all_day),
+                    'endAt': serialize_task_datetime(entry.task.get('dueDate'), entry.end, entry.time_zone, entry.all_day),
+                },
+            })
+
+    for entry in entries:
+        overdue = is_task_overdue(entry.task, reference_time)
+        if entry.schedule_type == 'invalid':
+            risks.append({
+                'type': 'invalid-time-range',
+                'taskId': entry.task_id,
+                'projectId': entry.project_id,
+                'projectName': entry.project_name,
+                'title': entry.title,
+                'detail': 'dueDate is not after startDate.',
+            })
+        elif overdue:
+            risks.append({
+                'type': 'overdue',
+                'taskId': entry.task_id,
+                'projectId': entry.project_id,
+                'projectName': entry.project_name,
+                'title': entry.title,
+                'detail': 'Task is overdue relative to the reference time.',
+            })
+        elif entry.schedule_type == 'deadline-only' and entry.priority >= 3:
+            risks.append({
+                'type': 'deadline-without-time-block',
+                'taskId': entry.task_id,
+                'projectId': entry.project_id,
+                'projectName': entry.project_name,
+                'title': entry.title,
+                'detail': 'Task has a due date but no scheduled start block.',
+            })
+        elif entry.schedule_type == 'start-only':
+            risks.append({
+                'type': 'start-without-end',
+                'taskId': entry.task_id,
+                'projectId': entry.project_id,
+                'projectName': entry.project_name,
+                'title': entry.title,
+                'detail': 'Task has a start time but no explicit end time.',
+            })
+        elif entry.schedule_type == 'unscheduled' and entry.priority >= 3:
+            risks.append({
+                'type': 'unscheduled-priority-task',
+                'taskId': entry.task_id,
+                'projectId': entry.project_id,
+                'projectName': entry.project_name,
+                'title': entry.title,
+                'detail': 'High-priority task has no time assignment yet.',
+            })
+
+    summary = {
+        'taskCount': len(entries),
+        'timedTaskCount': len([entry for entry in entries if entry.schedule_type == 'timed']),
+        'allDayTaskCount': len([entry for entry in entries if entry.schedule_type == 'all-day']),
+        'deadlineOnlyCount': len([entry for entry in entries if entry.schedule_type == 'deadline-only']),
+        'startOnlyCount': len([entry for entry in entries if entry.schedule_type == 'start-only']),
+        'unscheduledCount': len([entry for entry in entries if entry.schedule_type == 'unscheduled']),
+        'conflictCount': len(conflicts),
+        'riskCount': len(risks),
+        'busyWindowCount': len(busy_windows),
+    }
+    return conflicts, risks, summary
+
+
+def round_up_datetime(value: datetime, step_minutes: int) -> datetime:
+    if step_minutes <= 1:
+        return value.replace(second=0, microsecond=0)
+    trimmed = value.replace(second=0, microsecond=0)
+    remainder = trimmed.minute % step_minutes
+    if remainder == 0 and value.second == 0 and value.microsecond == 0:
+        return trimmed
+    return trimmed + timedelta(minutes=(step_minutes - remainder) % step_minutes or step_minutes)
+
+
+def first_overlapping_window(start: datetime, end: datetime, windows: list[BusyWindow]) -> BusyWindow | None:
+    for window in sorted(windows, key=lambda item: (item.start, item.end, item.label)):
+        if interval_overlaps(start, end, window.start, window.end):
+            return window
+    return None
+
+
+def make_entry_window(entry: ScheduleEntry, start: datetime, end: datetime, source: str) -> BusyWindow:
+    label = f"{entry.title} @ {entry.project_name}" if entry.project_name else entry.title
+    return BusyWindow(label=label, start=start, end=end, source=source)
+
+
+def find_next_available_slot(
+    candidate_start: datetime,
+    duration_minutes: int,
+    occupied_windows: list[BusyWindow],
+    search_end: datetime,
+    step_minutes: int,
+) -> tuple[datetime, datetime] | None:
+    current_start = round_up_datetime(candidate_start, step_minutes)
+    duration = timedelta(minutes=duration_minutes)
+    windows = sorted(occupied_windows, key=lambda item: (item.start, item.end, item.label))
+    while current_start + duration <= search_end:
+        current_end = current_start + duration
+        overlap = first_overlapping_window(current_start, current_end, windows)
+        if overlap is None:
+            return current_start, current_end
+        current_start = round_up_datetime(max(current_start + timedelta(minutes=step_minutes), overlap.end), step_minutes)
+    return None
+
+
+def propose_rebalanced_schedule(
+    entries: list[ScheduleEntry],
+    busy_windows: list[BusyWindow],
+    reference_time: datetime,
+    search_horizon_days: int,
+    step_minutes: int,
+    task_queries: list[str],
+    protected_titles: list[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    timed_entries = [
+        entry
+        for entry in sorted(entries, key=schedule_entry_sort_key)
+        if entry.schedule_type == 'timed' and entry.start is not None and entry.end is not None and entry.duration_minutes is not None
+    ]
+    movable_ids = {
+        entry.task_id
+        for entry in timed_entries
+        if schedule_entry_matches_queries(entry, task_queries) and not schedule_entry_is_protected(entry, protected_titles)
+    }
+
+    fixed_windows = list(busy_windows)
+    for entry in timed_entries:
+        if entry.task_id in movable_ids:
+            continue
+        if entry.end is not None and entry.end > reference_time:
+            fixed_windows.append(make_entry_window(entry, entry.start, entry.end, 'fixed-task'))
+
+    proposals: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    placed_windows: list[BusyWindow] = []
+    search_end = reference_time + timedelta(days=search_horizon_days)
+
+    for entry in timed_entries:
+        if entry.task_id not in movable_ids:
+            continue
+        if entry.end is not None and entry.end <= reference_time:
+            continue
+
+        occupied_windows = fixed_windows + placed_windows
+        overlap = first_overlapping_window(entry.start, entry.end, occupied_windows)
+        starts_in_past = entry.start < reference_time
+        if overlap is None and not starts_in_past:
+            placed_windows.append(make_entry_window(entry, entry.start, entry.end, 'kept-task'))
+            continue
+
+        candidate_start = entry.start
+        reason = 'schedule optimization'
+        if overlap is not None:
+            candidate_start = max(candidate_start, overlap.end)
+            reason = f"overlaps {overlap.source}: {overlap.label}"
+        if starts_in_past:
+            candidate_start = max(candidate_start, reference_time)
+            if overlap is None:
+                reason = 'starts before the reference time'
+
+        slot = find_next_available_slot(
+            candidate_start=candidate_start,
+            duration_minutes=entry.duration_minutes,
+            occupied_windows=occupied_windows,
+            search_end=search_end,
+            step_minutes=step_minutes,
+        )
+        if slot is None:
+            skipped.append({
+                'taskId': entry.task_id,
+                'projectId': entry.project_id,
+                'projectName': entry.project_name,
+                'title': entry.title,
+                'reason': 'No available slot found within the search horizon.',
+            })
+            placed_windows.append(make_entry_window(entry, entry.start, entry.end, 'unchanged-task'))
+            continue
+
+        new_start, new_end = slot
+        if new_start == entry.start and new_end == entry.end:
+            placed_windows.append(make_entry_window(entry, entry.start, entry.end, 'kept-task'))
+            continue
+
+        proposals.append({
+            'taskId': entry.task_id,
+            'projectId': entry.project_id,
+            'projectName': entry.project_name,
+            'title': entry.title,
+            'timeZone': entry.time_zone,
+            'oldStartDate': serialize_task_datetime(entry.task.get('startDate'), entry.start, entry.time_zone, entry.all_day),
+            'oldDueDate': serialize_task_datetime(entry.task.get('dueDate'), entry.end, entry.time_zone, entry.all_day),
+            'newStartDate': format_schedule_datetime(new_start, entry.time_zone),
+            'newDueDate': format_schedule_datetime(new_end, entry.time_zone),
+            'durationMinutes': entry.duration_minutes,
+            'reason': reason,
+        })
+        placed_windows.append(make_entry_window(entry, new_start, new_end, 'proposed-task'))
+
+    return proposals, skipped
 
 def task_priority_value(task: dict[str, Any]) -> int:
     value = task.get("priority")
@@ -2139,6 +2650,147 @@ def command_subtask_smart_delete(args: argparse.Namespace, region: RegionConfig,
     })
 
 
+
+
+def build_schedule_entries(
+    tasks: list[dict[str, Any]],
+    reference_time: datetime,
+    default_duration_minutes: int,
+    horizon_days: int | None,
+) -> list[ScheduleEntry]:
+    entries = [build_schedule_entry(task, default_duration_minutes) for task in tasks]
+    entries = [entry for entry in entries if schedule_entry_within_horizon(entry, reference_time, horizon_days)]
+    entries.sort(key=schedule_entry_sort_key)
+    return entries
+
+
+def command_schedule_analyze(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    if args.default_duration_minutes <= 0:
+        raise CliError('--default-duration-minutes must be greater than 0.')
+    if args.days is not None and args.days < 0:
+        raise CliError('--days must be 0 or greater.')
+
+    reference_time = resolve_reference_time(getattr(args, 'reference_time', None), getattr(args, 'time_zone', None))
+    project, tasks = collect_tasks(
+        args,
+        region,
+        token_path,
+        project_id=args.project_id,
+        project_name=getattr(args, 'project_name', None),
+        include_completed=False,
+        include_closed_projects=args.include_closed_projects,
+    )
+    entries = build_schedule_entries(tasks, reference_time, args.default_duration_minutes, args.days)
+    busy_windows = build_busy_windows(args, reference_time)
+    conflicts, risks, summary = build_schedule_analysis(entries, busy_windows, reference_time)
+    serialized_tasks = [serialize_schedule_entry(entry, reference_time) for entry in entries]
+    if args.limit and args.limit > 0:
+        serialized_tasks = serialized_tasks[: args.limit]
+    emit({
+        'ok': True,
+        'project': project,
+        'referenceTime': format_schedule_datetime(reference_time, getattr(args, 'time_zone', None)),
+        'summary': summary,
+        'busyWindows': [serialize_busy_window(window, getattr(args, 'time_zone', None)) for window in busy_windows],
+        'conflicts': conflicts,
+        'risks': risks,
+        'count': len(serialized_tasks),
+        'tasks': serialized_tasks,
+    })
+
+
+def command_schedule_rebalance(args: argparse.Namespace, region: RegionConfig, token_path: Path) -> None:
+    if args.default_duration_minutes <= 0:
+        raise CliError('--default-duration-minutes must be greater than 0.')
+    if args.days is not None and args.days < 0:
+        raise CliError('--days must be 0 or greater.')
+    if args.step_minutes <= 0:
+        raise CliError('--step-minutes must be greater than 0.')
+    if args.search_horizon_days <= 0:
+        raise CliError('--search-horizon-days must be greater than 0.')
+
+    reference_time = resolve_reference_time(getattr(args, 'reference_time', None), getattr(args, 'time_zone', None))
+    project, tasks = collect_tasks(
+        args,
+        region,
+        token_path,
+        project_id=args.project_id,
+        project_name=getattr(args, 'project_name', None),
+        include_completed=False,
+        include_closed_projects=args.include_closed_projects,
+    )
+    entries = build_schedule_entries(tasks, reference_time, args.default_duration_minutes, args.days)
+    busy_windows = build_busy_windows(args, reference_time)
+    conflicts, risks, summary = build_schedule_analysis(entries, busy_windows, reference_time)
+    proposals, skipped = propose_rebalanced_schedule(
+        entries=entries,
+        busy_windows=busy_windows,
+        reference_time=reference_time,
+        search_horizon_days=args.search_horizon_days,
+        step_minutes=args.step_minutes,
+        task_queries=list(args.task_query or []),
+        protected_titles=list(args.protect_task_title or []),
+    )
+
+    applied: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    if args.apply:
+        for proposal in proposals:
+            update_args = argparse.Namespace(
+                task_id=proposal['taskId'],
+                project_id=proposal['projectId'],
+                title=None,
+                content=None,
+                desc=None,
+                priority=None,
+                due_date=proposal['newDueDate'],
+                start_date=proposal['newStartDate'],
+                time_zone=proposal['timeZone'],
+                all_day=False,
+                tags=None,
+                repeat_flag=None,
+                reminders=None,
+                subtask=None,
+                clear_due_date=False,
+                clear_start_date=False,
+            )
+            try:
+                payload = build_task_payload(update_args, include_identity=True)
+                task = api_request(args, region, token_path, 'POST', f"/task/{proposal['taskId']}", json_body=payload)
+                applied.append({
+                    'taskId': proposal['taskId'],
+                    'projectId': proposal['projectId'],
+                    'title': proposal['title'],
+                    'newStartDate': proposal['newStartDate'],
+                    'newDueDate': proposal['newDueDate'],
+                    'task': task,
+                })
+            except CliError as exc:
+                failed.append({
+                    'taskId': proposal['taskId'],
+                    'projectId': proposal['projectId'],
+                    'title': proposal['title'],
+                    'error': str(exc),
+                })
+
+    emit({
+        'ok': len(failed) == 0,
+        'project': project,
+        'referenceTime': format_schedule_datetime(reference_time, getattr(args, 'time_zone', None)),
+        'summary': summary,
+        'busyWindows': [serialize_busy_window(window, getattr(args, 'time_zone', None)) for window in busy_windows],
+        'conflicts': conflicts,
+        'risks': risks,
+        'proposalCount': len(proposals),
+        'proposals': proposals,
+        'skipped': skipped,
+        'applyRequested': bool(args.apply),
+        'appliedCount': len(applied),
+        'failedCount': len(failed),
+        'applied': applied,
+        'failed': failed,
+    })
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ticktick_openclaw.py",
@@ -2334,6 +2986,37 @@ def build_parser() -> argparse.ArgumentParser:
     tasks_focus.add_argument("--include-closed-projects", action="store_true")
     tasks_focus.add_argument("--limit", type=int, default=0)
 
+
+    schedule_analyze = subparsers.add_parser('schedule-analyze', help='Analyze active tasks as a schedule and detect conflicts')
+    schedule_analyze.add_argument('--project-id')
+    schedule_analyze.add_argument('--project-name')
+    schedule_analyze.add_argument('--include-closed-projects', action='store_true')
+    schedule_analyze.add_argument('--reference-time')
+    schedule_analyze.add_argument('--time-zone')
+    schedule_analyze.add_argument('--busy-window', action='append', help="Repeat 'start/end' blocks for unavailable time")
+    schedule_analyze.add_argument('--current-task-title')
+    schedule_analyze.add_argument('--current-task-until')
+    schedule_analyze.add_argument('--default-duration-minutes', type=int, default=30)
+    schedule_analyze.add_argument('--days', type=int)
+    schedule_analyze.add_argument('--limit', type=int, default=0)
+
+    schedule_rebalance = subparsers.add_parser('schedule-rebalance', help='Propose or apply task rescheduling after conflicts or blocked time')
+    schedule_rebalance.add_argument('--project-id')
+    schedule_rebalance.add_argument('--project-name')
+    schedule_rebalance.add_argument('--include-closed-projects', action='store_true')
+    schedule_rebalance.add_argument('--reference-time')
+    schedule_rebalance.add_argument('--time-zone')
+    schedule_rebalance.add_argument('--busy-window', action='append', help="Repeat 'start/end' blocks for unavailable time")
+    schedule_rebalance.add_argument('--current-task-title')
+    schedule_rebalance.add_argument('--current-task-until')
+    schedule_rebalance.add_argument('--default-duration-minutes', type=int, default=30)
+    schedule_rebalance.add_argument('--days', type=int)
+    schedule_rebalance.add_argument('--search-horizon-days', type=int, default=14)
+    schedule_rebalance.add_argument('--step-minutes', type=int, default=15)
+    schedule_rebalance.add_argument('--task-query', action='append', help='Only move tasks matching these queries')
+    schedule_rebalance.add_argument('--protect-task-title', action='append', help='Repeat to keep matching tasks fixed')
+    schedule_rebalance.add_argument('--apply', action='store_true')
+
     tasks_batch_create = subparsers.add_parser("tasks-batch-create", help="Create many tasks from a JSON array")
     tasks_batch_create.add_argument("--json", help="Inline JSON array")
     tasks_batch_create.add_argument("--json-file", help="Path to JSON file containing an array of task objects")
@@ -2482,6 +3165,10 @@ def run(args: argparse.Namespace) -> None:
         command_tasks_due(args, region, token_path)
     elif args.command == "tasks-focus":
         command_tasks_focus(args, region, token_path)
+    elif args.command == "schedule-analyze":
+        command_schedule_analyze(args, region, token_path)
+    elif args.command == "schedule-rebalance":
+        command_schedule_rebalance(args, region, token_path)
     elif args.command == "tasks-batch-create":
         command_tasks_batch_create(args, region, token_path)
     elif args.command == "subtask-add":

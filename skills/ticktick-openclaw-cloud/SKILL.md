@@ -1,13 +1,13 @@
 ---
 name: ticktick-openclaw-cloud
-description: Manage Dida365/TickTick tasks and projects from cloud-hosted OpenClaw using a headless OAuth flow, token auto-refresh, smart name resolution, JSON CLI operations, and parent-task/subtask workflows. Use when users ask to connect Dida/TickTick accounts, create/update/complete/delete tasks, search tasks by title or content, manage parent-task and subtask structures, list projects/tasks, or troubleshoot auth/token issues in environments without local callback servers.
+description: Manage Dida365/TickTick tasks and projects from cloud-hosted OpenClaw using a headless OAuth flow, token auto-refresh, smart name resolution, JSON CLI operations, schedule analysis, conflict handling, and parent-task/subtask workflows. Use when users ask to connect Dida/TickTick accounts, create/update/complete/delete tasks, search tasks by title or content, review all active tasks, detect schedule conflicts, rebalance plans after blocked time, manage parent-task and subtask structures, list projects/tasks, or troubleshoot auth/token issues in environments without local callback servers.
 ---
 
 # TickTick OpenClaw Cloud
 
 ## Overview
 
-Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the bundled script for OAuth authorization URL generation, callback exchange, token refresh, task/project CRUD, smart name-based resolution, broader task search, natural-language date parsing, due-date views, batch creation, and parent-task/subtask operations.
+Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the bundled script for OAuth authorization URL generation, callback exchange, token refresh, task/project CRUD, smart name-based resolution, broader task search, natural-language date parsing, schedule analysis, conflict-aware rebalancing, due-date views, batch creation, and parent-task/subtask operations.
 
 ## Smart Execution Rules
 
@@ -16,12 +16,14 @@ Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the b
 3. Use `task-find` for title-only resolution. Use `task-search` when the user references task content, descriptions, subtasks, tags, or project text.
 4. If a single exact match exists, proceed. If one match clearly outranks the rest, proceed. If multiple plausible matches remain, ask one short clarification.
 5. For date-oriented requests like "today", "tomorrow", "this week", or "overdue", prefer `tasks-due`. For focus-oriented requests like "engaged" or "next", prefer `tasks-focus`.
-6. Date fields on task/subtask creation and updates accept explicit TickTick format and common natural phrases like `明天下午3点`, `下周一上午9点`, `tomorrow 3pm`, or `2026-03-10 18:30`.
-7. For batch creation requests, use `tasks-batch-create` with a JSON array instead of looping one task at a time.
-8. For checklist-style requests, treat the parent task as the main task and subtasks as `items`. Use `task-create --subtask ...` when creating a parent task. For existing parent tasks without IDs, use `subtask-find` and `subtask-smart-*`.
-9. Before `task-update` or `task-smart-update`, change only the fields the user explicitly asked to change.
-10. Never invent due dates, priorities, or project names unless the user implied them clearly. If urgency is explicit, map priority as low=`1`, medium=`3`, high=`5`.
-11. When a task title is ambiguous across projects, prefer the project mentioned by the user. If none is mentioned, return the smallest matching set and ask only if needed.
+6. For requests to review all active tasks, detect schedule conflicts, evaluate plan quality, or summarize what is coming next, prefer `schedule-analyze`.
+7. For requests like "I cannot do these tasks now", "I am busy until 5pm", "I am already working on something else", or "please push the later tasks back", prefer `schedule-rebalance` first without `--apply`, then repeat with `--apply` only after the new plan is acceptable or the user explicitly asks to commit it.
+8. Date fields on task/subtask creation and updates accept explicit TickTick format and common natural phrases like `明天下午3点`, `下周一上午9点`, `tomorrow 3pm`, or `2026-03-10 18:30`.
+9. For batch creation requests, use `tasks-batch-create` with a JSON array instead of looping one task at a time.
+10. For checklist-style requests, treat the parent task as the main task and subtasks as `items`. Use `task-create --subtask ...` when creating a parent task. For existing parent tasks without IDs, use `subtask-find` and `subtask-smart-*`.
+11. Before `task-update` or `task-smart-update`, change only the fields the user explicitly asked to change.
+12. Never invent due dates, priorities, or project names unless the user implied them clearly. If urgency is explicit, map priority as low=`1`, medium=`3`, high=`5`.
+13. When a task title is ambiguous across projects, prefer the project mentioned by the user. If none is mentioned, return the smallest matching set and ask only if needed.
 
 ## Common Intent Mapping
 
@@ -32,6 +34,9 @@ Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the b
 - "Search tasks by note/content/subtask": `task-search`
 - "Show due today / overdue / this week": `tasks-due`
 - "Show engaged / next tasks": `tasks-focus`
+- "Extract all tasks as a schedule": `schedule-analyze`
+- "I am blocked / busy / doing something else": `schedule-rebalance`
+- "Optimize today's or this week's arrangement": `schedule-analyze`, then `schedule-rebalance`
 - "Create many tasks": `tasks-batch-create`
 - "Add or edit subtasks without IDs": `subtask-smart-add` / `subtask-smart-update` / `subtask-smart-complete` / `subtask-smart-delete`
 - "Move tasks between projects": resolve both projects, resolve tasks, then `task-move`
@@ -71,8 +76,10 @@ Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the b
 5. Use `task-get` and `subtask-*` commands when IDs are already known.
 6. Use `subtask-find` and `subtask-smart-*` when the user references parent/subtask titles instead of IDs.
 7. Use `tasks-due`, `tasks-focus`, `tasks-filter`, and `tasks-completed` for reporting or review workflows.
-8. Use `tasks-batch-create` when the user provides multiple tasks in one turn.
-9. Use `token-status --auto-refresh` before long task batches.
+8. Use `schedule-analyze` before any large-scale planning discussion so the model sees normalized task timing, conflicts, and risk flags in one JSON response.
+9. Use `schedule-rebalance` for blocked-time or cascading-reschedule requests. Prefer a dry run first, inspect `proposals`, then rerun with `--apply` to commit the shifts.
+10. Use `tasks-batch-create` when the user provides multiple tasks in one turn.
+11. Use `token-status --auto-refresh` before long task batches or schedule-wide adjustments.
 
 ## Core Commands
 
@@ -100,6 +107,9 @@ python {baseDir}/scripts/ticktick_openclaw.py task-smart-complete --task-title "
 python {baseDir}/scripts/ticktick_openclaw.py task-smart-delete --task-title "Prepare proposal" --project-name "Work"
 python {baseDir}/scripts/ticktick_openclaw.py tasks-due --when overdue
 python {baseDir}/scripts/ticktick_openclaw.py tasks-focus --mode engaged
+python {baseDir}/scripts/ticktick_openclaw.py schedule-analyze --days 7
+python {baseDir}/scripts/ticktick_openclaw.py schedule-rebalance --busy-window "2026-03-08 14:00/2026-03-08 17:00"
+python {baseDir}/scripts/ticktick_openclaw.py schedule-rebalance --current-task-title "Incident response" --current-task-until "今天18:00" --apply
 python {baseDir}/scripts/ticktick_openclaw.py tasks-batch-create --json-file "tasks.json"
 python {baseDir}/scripts/ticktick_openclaw.py task-move --from-project-id "<project_id>" --to-project-id "<other_project_id>" --task-id "<task_id>"
 python {baseDir}/scripts/ticktick_openclaw.py tasks-filter --project-name "Work" --status 0 --priority 3,5
@@ -120,6 +130,8 @@ python {baseDir}/scripts/ticktick_openclaw.py subtask-smart-delete --parent-task
 - `project-id` can be a regular project ID or `inbox`.
 - `project-name` is resolved by exact/prefix/contains matching.
 - Subtasks map to the official `items` field in task objects.
+- `schedule-analyze` and `schedule-rebalance` accept repeated `--busy-window "start/end"` blocks; both sides can use natural-language dates and times.
+- `schedule-rebalance --task-query ...` limits moves to matching tasks, while `--protect-task-title ...` keeps selected tasks fixed.
 - Script outputs JSON by default for agent-safe parsing.
 
 ## Reliability Rules
@@ -128,7 +140,7 @@ python {baseDir}/scripts/ticktick_openclaw.py subtask-smart-delete --parent-task
 2. Use `dida` region for Dida365 accounts and `ticktick` for TickTick accounts.
 3. If callback exchange fails with state mismatch, regenerate URL via `auth-url`.
 4. If refresh fails, re-run `auth-url` + `auth-exchange`.
-5. `task-search`, `tasks-due`, `tasks-focus`, `tasks-batch-create`, and all `*-smart-*` commands are convenience wrappers over the official endpoints already documented in `references/openapi-cheatsheet.md`.
+5. `task-search`, `tasks-due`, `tasks-focus`, `schedule-analyze`, `schedule-rebalance`, `tasks-batch-create`, and all `*-smart-*` commands are convenience wrappers over the official endpoints already documented in `references/openapi-cheatsheet.md`.
 
 ## References
 
