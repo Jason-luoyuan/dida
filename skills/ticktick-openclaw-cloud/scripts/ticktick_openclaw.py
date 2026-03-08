@@ -5,6 +5,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -15,6 +16,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_SCOPE = "tasks:read tasks:write"
 
@@ -429,6 +431,238 @@ def parse_ticktick_datetime(raw_value: str | None) -> datetime | None:
         except ValueError:
             return None
     return None
+
+
+CHINESE_WEEKDAY_MAP = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+ENGLISH_WEEKDAY_MAP = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+FALLBACK_TIMEZONE_OFFSETS = {
+    "UTC": 0,
+    "Etc/UTC": 0,
+    "Asia/Shanghai": 8,
+    "Asia/Chongqing": 8,
+    "Asia/Hong_Kong": 8,
+    "Asia/Taipei": 8,
+    "Asia/Seoul": 9,
+    "Asia/Tokyo": 9,
+    "Europe/London": 0,
+    "America/New_York": -5,
+    "America/Chicago": -6,
+    "America/Denver": -7,
+    "America/Los_Angeles": -8,
+}
+
+
+def default_time_zone_name(explicit_time_zone: str | None = None) -> str:
+    return explicit_time_zone or os.getenv("TICKTICK_DEFAULT_TIMEZONE") or os.getenv("TZ") or "Asia/Shanghai"
+
+
+def resolve_time_zone(explicit_time_zone: str | None = None) -> ZoneInfo | timezone:
+    time_zone_name = default_time_zone_name(explicit_time_zone)
+    try:
+        return ZoneInfo(time_zone_name)
+    except ZoneInfoNotFoundError as exc:
+        if time_zone_name in FALLBACK_TIMEZONE_OFFSETS:
+            offset_hours = FALLBACK_TIMEZONE_OFFSETS[time_zone_name]
+            return timezone(timedelta(hours=offset_hours), name=time_zone_name)
+        raise CliError(f"Invalid time zone '{time_zone_name}'. Use an IANA zone like Asia/Shanghai.") from exc
+
+
+def format_ticktick_datetime(value: datetime) -> str:
+    return value.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def looks_like_date_only(value: str) -> bool:
+    return bool(
+        re.fullmatch(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", value)
+        or re.fullmatch(r"\d{1,2}月\d{1,2}日?", value)
+        or re.fullmatch(r"\d{1,2}[-/]\d{1,2}", value)
+    )
+
+
+def normalize_explicit_datetime_input(raw_value: str, explicit_time_zone: str | None = None) -> str | None:
+    candidate = raw_value.strip().replace("：", ":")
+    parsed = parse_ticktick_datetime(candidate)
+    if parsed is None:
+        return None
+    if looks_like_date_only(candidate):
+        return parsed.strftime("%Y-%m-%d")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=resolve_time_zone(explicit_time_zone))
+    return format_ticktick_datetime(parsed)
+
+
+def parse_date_from_text(raw_value: str, explicit_time_zone: str | None = None) -> datetime.date | None:
+    zone = resolve_time_zone(explicit_time_zone)
+    now_local = datetime.now(zone)
+    today = now_local.date()
+    compact = raw_value.strip().replace(" ", "").replace("：", ":")
+    lowered = raw_value.casefold()
+
+    full_date_match = re.search(r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})", compact)
+    if full_date_match:
+        year, month, day = (int(value) for value in full_date_match.groups())
+        return datetime(year, month, day).date()
+
+    month_day_match = re.search(r"(\d{1,2})月(\d{1,2})日?", compact)
+    if month_day_match:
+        month, day = (int(value) for value in month_day_match.groups())
+        candidate = datetime(today.year, month, day).date()
+        if candidate < today - timedelta(days=1):
+            candidate = datetime(today.year + 1, month, day).date()
+        return candidate
+
+    short_date_match = re.search(r"(?<!\d)(\d{1,2})[-/](\d{1,2})(?!\d)", compact)
+    if short_date_match:
+        month, day = (int(value) for value in short_date_match.groups())
+        candidate = datetime(today.year, month, day).date()
+        if candidate < today - timedelta(days=1):
+            candidate = datetime(today.year + 1, month, day).date()
+        return candidate
+
+    for phrase, offset in (("大后天", 3), ("后天", 2), ("明天", 1), ("今天", 0), ("今日", 0), ("昨天", -1), ("前天", -2)):
+        if phrase in compact:
+            return today + timedelta(days=offset)
+
+    for phrase, offset in (("day after tomorrow", 2), ("tomorrow", 1), ("today", 0), ("yesterday", -1)):
+        if phrase in lowered:
+            return today + timedelta(days=offset)
+
+    chinese_weekday_match = re.search(r"(下下|下|本|这)?(?:周|星期)([一二三四五六日天])", compact)
+    if chinese_weekday_match:
+        prefix = chinese_weekday_match.group(1) or ""
+        target_weekday = CHINESE_WEEKDAY_MAP[chinese_weekday_match.group(2)]
+        current_weekday = today.weekday()
+        if prefix in ("本", "这"):
+            delta = target_weekday - current_weekday
+        elif prefix == "下":
+            delta = target_weekday - current_weekday + 7
+        elif prefix == "下下":
+            delta = target_weekday - current_weekday + 14
+        else:
+            delta = target_weekday - current_weekday
+            if delta < 0:
+                delta += 7
+        return today + timedelta(days=delta)
+
+    english_weekday_match = re.search(r"(next|this)?\s*(monday|tuesday|wednesday|thursday|friday|saturday|sunday)", lowered)
+    if english_weekday_match:
+        prefix = english_weekday_match.group(1) or ""
+        target_weekday = ENGLISH_WEEKDAY_MAP[english_weekday_match.group(2)]
+        current_weekday = today.weekday()
+        if prefix == "this":
+            delta = target_weekday - current_weekday
+        elif prefix == "next":
+            delta = target_weekday - current_weekday + 7
+        else:
+            delta = target_weekday - current_weekday
+            if delta < 0:
+                delta += 7
+        return today + timedelta(days=delta)
+
+    return None
+
+
+def parse_time_from_text(raw_value: str) -> tuple[int, int] | None:
+    compact = raw_value.strip().replace(" ", "").replace("：", ":").casefold()
+
+    ampm_match = re.search(r"(?<!\d)(\d{1,2})(?::(\d{1,2}))?\s*(am|pm)(?![a-z])", compact)
+    if ampm_match:
+        hour = int(ampm_match.group(1))
+        minute = int(ampm_match.group(2) or 0)
+        ampm = ampm_match.group(3)
+        if ampm == "am":
+            hour = 0 if hour == 12 else hour
+        else:
+            hour = hour if hour == 12 else hour + 12
+        return hour, minute
+
+    period = None
+    for marker in ("凌晨", "早上", "早晨", "上午", "中午", "下午", "晚上", "傍晚", "今晚"):
+        if marker in compact:
+            period = marker
+            break
+
+    match = re.search(r"(?<!\d)(\d{1,2})点半", compact)
+    if match:
+        hour, minute = int(match.group(1)), 30
+    else:
+        match = re.search(r"(?<!\d)(\d{1,2})点一刻", compact)
+        if match:
+            hour, minute = int(match.group(1)), 15
+        else:
+            match = re.search(r"(?<!\d)(\d{1,2})点三刻", compact)
+            if match:
+                hour, minute = int(match.group(1)), 45
+            else:
+                match = re.search(r"(?<!\d)(\d{1,2})点(\d{1,2})分?", compact)
+                if match:
+                    hour, minute = int(match.group(1)), int(match.group(2))
+                else:
+                    match = re.search(r"(?<!\d)(\d{1,2})点(?!\d)", compact)
+                    if match:
+                        hour, minute = int(match.group(1)), 0
+                    else:
+                        match = re.search(r"(?<!\d)(\d{1,2}):(\d{1,2})(?!\d)", compact)
+                        if match:
+                            hour, minute = int(match.group(1)), int(match.group(2))
+                        else:
+                            return None
+
+    if period in ("下午", "晚上", "傍晚", "今晚") and 1 <= hour <= 11:
+        hour += 12
+    elif period == "中午" and 1 <= hour <= 10:
+        hour += 12
+    elif period in ("凌晨",) and hour == 12:
+        hour = 0
+    elif period in ("早上", "早晨", "上午") and hour == 12:
+        hour = 0
+
+    return hour, minute
+
+
+def parse_natural_datetime_input(raw_value: str, explicit_time_zone: str | None = None) -> str | None:
+    date_value = parse_date_from_text(raw_value, explicit_time_zone)
+    time_value = parse_time_from_text(raw_value)
+    if date_value is None and time_value is None:
+        return None
+    if date_value is None:
+        zone = resolve_time_zone(explicit_time_zone)
+        date_value = datetime.now(zone).date()
+    if time_value is None:
+        return date_value.strftime("%Y-%m-%d")
+    zone = resolve_time_zone(explicit_time_zone)
+    target = datetime(
+        date_value.year,
+        date_value.month,
+        date_value.day,
+        time_value[0],
+        time_value[1],
+        tzinfo=zone,
+    )
+    return format_ticktick_datetime(target)
+
+
+def normalize_user_datetime_value(raw_value: str | None, explicit_time_zone: str | None = None) -> str | None:
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip()
+    if not text:
+        return None
+    explicit = normalize_explicit_datetime_input(text, explicit_time_zone)
+    if explicit is not None:
+        return explicit
+    natural = parse_natural_datetime_input(text, explicit_time_zone)
+    if natural is not None:
+        return natural
+    return raw_value
 
 
 def task_priority_value(task: dict[str, Any]) -> int:
@@ -1115,12 +1349,15 @@ def build_task_payload(args: argparse.Namespace, include_identity: bool) -> dict
         payload["title"] = args.title
         payload["projectId"] = args.project_id or "inbox"
 
+    normalized_due_date = normalize_user_datetime_value(args.due_date, args.time_zone)
+    normalized_start_date = normalize_user_datetime_value(args.start_date, args.time_zone)
+
     mapping = {
         "title": args.title,
         "content": args.content,
         "desc": args.desc,
-        "dueDate": args.due_date,
-        "startDate": args.start_date,
+        "dueDate": normalized_due_date,
+        "startDate": normalized_start_date,
         "timeZone": args.time_zone,
         "repeatFlag": getattr(args, "repeat_flag", None),
     }
@@ -1474,21 +1711,28 @@ def command_tasks_batch_create(args: argparse.Namespace, region: RegionConfig, t
                 "title": title,
                 "projectId": resolved_project_id or "inbox",
             }
-            for input_key, output_key in (
-                ("content", "content"),
-                ("desc", "desc"),
-                ("dueDate", "dueDate"),
-                ("due_date", "dueDate"),
-                ("startDate", "startDate"),
-                ("start_date", "startDate"),
-                ("timeZone", "timeZone"),
-                ("time_zone", "timeZone"),
-                ("repeatFlag", "repeatFlag"),
-                ("repeat_flag", "repeatFlag"),
-            ):
-                value = item.get(input_key)
-                if value is not None:
-                    payload[output_key] = value
+            item_time_zone = item.get("timeZone") or item.get("time_zone")
+            if item.get("content") is not None:
+                payload["content"] = item.get("content")
+            if item.get("desc") is not None:
+                payload["desc"] = item.get("desc")
+            normalized_due_date = normalize_user_datetime_value(
+                item.get("dueDate") or item.get("due_date"),
+                item_time_zone if isinstance(item_time_zone, str) else None,
+            )
+            if normalized_due_date is not None:
+                payload["dueDate"] = normalized_due_date
+            normalized_start_date = normalize_user_datetime_value(
+                item.get("startDate") or item.get("start_date"),
+                item_time_zone if isinstance(item_time_zone, str) else None,
+            )
+            if normalized_start_date is not None:
+                payload["startDate"] = normalized_start_date
+            if isinstance(item_time_zone, str) and item_time_zone.strip():
+                payload["timeZone"] = item_time_zone.strip()
+            repeat_flag = item.get("repeatFlag") or item.get("repeat_flag")
+            if repeat_flag is not None:
+                payload["repeatFlag"] = repeat_flag
 
             priority = item.get("priority")
             if priority is not None:
@@ -1564,10 +1808,12 @@ def command_tasks_completed(args: argparse.Namespace, region: RegionConfig, toke
             project_ids.append(resolved_project_id)
     if project_ids:
         payload["projectIds"] = project_ids
-    if args.start_date:
-        payload["startDate"] = args.start_date
-    if args.end_date:
-        payload["endDate"] = args.end_date
+    normalized_start_date = normalize_user_datetime_value(args.start_date)
+    normalized_end_date = normalize_user_datetime_value(args.end_date)
+    if normalized_start_date:
+        payload["startDate"] = normalized_start_date
+    if normalized_end_date:
+        payload["endDate"] = normalized_end_date
 
     response = api_request(args, region, token_path, "POST", "/task/completed", json_body=payload)
     tasks = response if isinstance(response, list) else []
@@ -1583,10 +1829,12 @@ def command_tasks_filter(args: argparse.Namespace, region: RegionConfig, token_p
             project_ids.append(resolved_project_id)
     if project_ids:
         payload["projectIds"] = project_ids
-    if args.start_date:
-        payload["startDate"] = args.start_date
-    if args.end_date:
-        payload["endDate"] = args.end_date
+    normalized_start_date = normalize_user_datetime_value(args.start_date)
+    normalized_end_date = normalize_user_datetime_value(args.end_date)
+    if normalized_start_date:
+        payload["startDate"] = normalized_start_date
+    if normalized_end_date:
+        payload["endDate"] = normalized_end_date
     if args.priority:
         payload["priority"] = parse_csv_ints(args.priority)
     if args.tag:
@@ -1607,8 +1855,9 @@ def command_subtask_add(args: argparse.Namespace, region: RegionConfig, token_pa
     items = [clean_subtask_item(item) for item in existing_items if isinstance(item, dict)]
 
     new_item: dict[str, Any] = {"title": args.title}
-    if args.start_date:
-        new_item["startDate"] = args.start_date
+    normalized_start_date = normalize_user_datetime_value(args.start_date, args.time_zone)
+    if normalized_start_date:
+        new_item["startDate"] = normalized_start_date
     if args.time_zone:
         new_item["timeZone"] = args.time_zone
     if args.sort_order is not None:
@@ -1640,8 +1889,9 @@ def command_subtask_update(args: argparse.Namespace, region: RegionConfig, token
     if args.title:
         target["title"] = args.title
         changed = True
+    normalized_start_date = normalize_user_datetime_value(args.start_date, args.time_zone) if args.start_date is not None else None
     if args.start_date is not None:
-        target["startDate"] = args.start_date
+        target["startDate"] = normalized_start_date
         changed = True
     if args.time_zone is not None:
         target["timeZone"] = args.time_zone
@@ -1738,8 +1988,9 @@ def command_subtask_smart_add(args: argparse.Namespace, region: RegionConfig, to
     items = [clean_subtask_item(item) for item in existing_items if isinstance(item, dict)]
 
     new_item: dict[str, Any] = {"title": args.title}
-    if args.start_date:
-        new_item["startDate"] = args.start_date
+    normalized_start_date = normalize_user_datetime_value(args.start_date, args.time_zone)
+    if normalized_start_date:
+        new_item["startDate"] = normalized_start_date
     if args.time_zone:
         new_item["timeZone"] = args.time_zone
     if args.sort_order is not None:
@@ -1786,8 +2037,9 @@ def command_subtask_smart_update(args: argparse.Namespace, region: RegionConfig,
     if args.new_title:
         target["title"] = args.new_title
         changed = True
+    normalized_start_date = normalize_user_datetime_value(args.start_date, args.time_zone) if args.start_date is not None else None
     if args.start_date is not None:
-        target["startDate"] = args.start_date
+        target["startDate"] = normalized_start_date
         changed = True
     if args.time_zone is not None:
         target["timeZone"] = args.time_zone

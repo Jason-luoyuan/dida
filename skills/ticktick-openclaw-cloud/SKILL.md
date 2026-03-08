@@ -7,7 +7,7 @@ description: Manage Dida365/TickTick tasks and projects from cloud-hosted OpenCl
 
 ## Overview
 
-Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the bundled script for OAuth authorization URL generation, callback exchange, token refresh, task/project CRUD, smart name-based resolution, broader task search, due-date views, batch creation, and parent-task/subtask operations.
+Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the bundled script for OAuth authorization URL generation, callback exchange, token refresh, task/project CRUD, smart name-based resolution, broader task search, natural-language date parsing, due-date views, batch creation, and parent-task/subtask operations.
 
 ## Smart Execution Rules
 
@@ -16,11 +16,12 @@ Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the b
 3. Use `task-find` for title-only resolution. Use `task-search` when the user references task content, descriptions, subtasks, tags, or project text.
 4. If a single exact match exists, proceed. If one match clearly outranks the rest, proceed. If multiple plausible matches remain, ask one short clarification.
 5. For date-oriented requests like "today", "tomorrow", "this week", or "overdue", prefer `tasks-due`. For focus-oriented requests like "engaged" or "next", prefer `tasks-focus`.
-6. For batch creation requests, use `tasks-batch-create` with a JSON array instead of looping one task at a time.
-7. For checklist-style requests, treat the parent task as the main task and subtasks as `items`. Use `task-create --subtask ...` when creating a parent task. For existing parent tasks without IDs, use `subtask-find` and `subtask-smart-*`.
-8. Before `task-update` or `task-smart-update`, change only the fields the user explicitly asked to change.
-9. Never invent due dates, priorities, or project names unless the user implied them clearly. If urgency is explicit, map priority as low=`1`, medium=`3`, high=`5`.
-10. When a task title is ambiguous across projects, prefer the project mentioned by the user. If none is mentioned, return the smallest matching set and ask only if needed.
+6. Date fields on task/subtask creation and updates accept explicit TickTick format and common natural phrases like `明天下午3点`, `下周一上午9点`, `tomorrow 3pm`, or `2026-03-10 18:30`.
+7. For batch creation requests, use `tasks-batch-create` with a JSON array instead of looping one task at a time.
+8. For checklist-style requests, treat the parent task as the main task and subtasks as `items`. Use `task-create --subtask ...` when creating a parent task. For existing parent tasks without IDs, use `subtask-find` and `subtask-smart-*`.
+9. Before `task-update` or `task-smart-update`, change only the fields the user explicitly asked to change.
+10. Never invent due dates, priorities, or project names unless the user implied them clearly. If urgency is explicit, map priority as low=`1`, medium=`3`, high=`5`.
+11. When a task title is ambiguous across projects, prefer the project mentioned by the user. If none is mentioned, return the smallest matching set and ask only if needed.
 
 ## Common Intent Mapping
 
@@ -114,7 +115,7 @@ python {baseDir}/scripts/ticktick_openclaw.py subtask-smart-delete --parent-task
 
 ## Input Conventions
 
-- Date-time fields use `"yyyy-MM-dd'T'HH:mm:ssZ"` format, for example `2026-03-08T10:00:00+0800`.
+- Date-time fields accept `"yyyy-MM-dd'T'HH:mm:ssZ"`, common ISO forms like `2026-03-10 18:30`, and natural phrases like `明天下午3点` or `下周一上午9点`.
 - Priority values: `0` (none), `1` (low), `3` (medium), `5` (high).
 - `project-id` can be a regular project ID or `inbox`.
 - `project-name` is resolved by exact/prefix/contains matching.

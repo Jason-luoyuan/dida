@@ -40,6 +40,7 @@
 6. Add GTD-style review helpers via `tasks-focus --mode engaged|next`.
 7. Add `tasks-batch-create` for multi-task creation from a single JSON array.
 8. Add `--project-name` support on task list/create/filter flows so the agent can act directly from user language without a manual ID lookup step.
+9. Add natural-language time normalization for common Chinese and English phrases before task/subtask API calls.
 
 ## Explicit Non-Adoptions
 

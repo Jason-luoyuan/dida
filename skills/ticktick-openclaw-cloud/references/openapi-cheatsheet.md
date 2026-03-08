@@ -105,6 +105,7 @@ These commands are wrappers over the official endpoints above, not additional ve
 - `task-search`: searches locally across task title, content, desc, subtasks, tags, and project names after pulling official task data.
 - `task-smart-*`: resolves task titles to stable IDs, then calls the official update/complete/delete endpoints.
 - `tasks-due`: filters official task data into `today`, `tomorrow`, `this-week`, `overdue`, or `--days N` views.
+- `normalize_user_datetime_value` inside the script converts common ISO and natural phrases like `明天下午3点`, `下周一上午9点`, and `tomorrow 3pm` into TickTick-compatible date strings before API calls.
 - `tasks-focus`: returns `engaged` and `next` task sets inspired by GTD-style review workflows.
 - `tasks-batch-create`: loops official `POST /task` calls from a JSON array.
 - `subtask-find` and `subtask-smart-*`: resolve parent task/subtask titles, then update the official `items` field on the parent task.
