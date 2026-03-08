@@ -19,6 +19,7 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_SCOPE = "tasks:read tasks:write"
+DEFAULT_LOCALHOST_REDIRECT_URI = "http://localhost:8080/callback"
 
 
 @dataclass(frozen=True)
@@ -246,6 +247,69 @@ def value_source(flag_value: str | None, env_name: str) -> str:
     if os.getenv(env_name):
         return 'env'
     return 'default'
+
+
+def default_port_for_scheme(scheme: str) -> int | None:
+    if scheme == 'http':
+        return 80
+    if scheme == 'https':
+        return 443
+    return None
+
+
+def classify_redirect_uri(redirect_uri: str | None) -> dict[str, Any]:
+    if not redirect_uri:
+        return {
+            'present': False,
+            'mode': 'missing',
+            'host': None,
+            'scheme': None,
+            'path': None,
+            'port': None,
+            'recommendedLocalhostUri': DEFAULT_LOCALHOST_REDIRECT_URI,
+        }
+
+    parsed = urlparse(redirect_uri)
+    host = (parsed.hostname or '').strip().lower() or None
+    scheme = (parsed.scheme or '').strip().lower() or None
+    path = parsed.path or '/'
+    port = parsed.port or default_port_for_scheme(scheme or '')
+
+    if not scheme or not host:
+        mode = 'invalid'
+    elif host in {'localhost', '127.0.0.1', '::1'}:
+        mode = 'localhost'
+    else:
+        mode = 'remote'
+
+    return {
+        'present': True,
+        'mode': mode,
+        'host': host,
+        'scheme': scheme,
+        'path': path,
+        'port': port,
+        'recommendedLocalhostUri': DEFAULT_LOCALHOST_REDIRECT_URI,
+    }
+
+
+def callback_url_matches_redirect_uri(callback_url: str, redirect_uri: str) -> bool:
+    callback = urlparse(callback_url)
+    redirect = urlparse(redirect_uri)
+    callback_scheme = (callback.scheme or '').strip().lower()
+    redirect_scheme = (redirect.scheme or '').strip().lower()
+    callback_host = (callback.hostname or '').strip().lower()
+    redirect_host = (redirect.hostname or '').strip().lower()
+    callback_port = callback.port or default_port_for_scheme(callback_scheme)
+    redirect_port = redirect.port or default_port_for_scheme(redirect_scheme)
+    callback_path = callback.path or '/'
+    redirect_path = redirect.path or '/'
+    return (
+        callback_scheme == redirect_scheme
+        and callback_host == redirect_host
+        and callback_port == redirect_port
+        and callback_path == redirect_path
+    )
 
 
 def probe_writable_directory(path: Path) -> tuple[bool, str | None]:
@@ -1711,14 +1775,29 @@ def command_auth_url(args: argparse.Namespace, region: RegionConfig, state_path:
     }
     write_json(state_path, state_payload)
 
+    redirect_uri_info = classify_redirect_uri(redirect_uri)
+    is_localhost_callback = redirect_uri_info['mode'] == 'localhost'
+
     emit(
         {
             "ok": True,
             "region": region.name,
             "scope": scope,
+            "redirect_uri": redirect_uri,
+            "redirect_uri_analysis": redirect_uri_info,
             "authorization_url": auth_url,
             "state": state,
             "state_file": str(state_path),
+            "callback_capture_mode": "manual_copy" if is_localhost_callback else "browser_redirect",
+            "next_steps": [
+                "Open authorization_url in a local browser and approve access.",
+                (
+                    "After approval, the browser may fail to open the localhost callback page. Copy the full callback URL from the address bar."
+                    if is_localhost_callback
+                    else "After approval, copy the full callback URL from the browser."
+                ),
+                "Run auth-exchange on the cloud host with --callback-url set to that full URL.",
+            ],
         }
     )
 
@@ -1757,6 +1836,11 @@ def command_auth_exchange(
     scope = (args.scope or os.getenv("TICKTICK_SCOPE") or DEFAULT_SCOPE).strip()
 
     auth_code, callback_state = extract_callback_values(args.callback_url, args.auth_code, args.state)
+
+    if args.callback_url and not callback_url_matches_redirect_uri(args.callback_url, redirect_uri):
+        raise CliError(
+            f"Callback URL does not match redirect URI. Expected base '{redirect_uri}'. Copy the full browser callback URL and keep TICKTICK_REDIRECT_URI unchanged."
+        )
 
     if not args.skip_state_check:
         state_doc = read_json(state_path)
@@ -1823,6 +1907,7 @@ def command_doctor(
     client_id = getattr(args, 'client_id', None) or os.getenv('TICKTICK_CLIENT_ID')
     client_secret = getattr(args, 'client_secret', None) or os.getenv('TICKTICK_CLIENT_SECRET')
     redirect_uri = getattr(args, 'redirect_uri', None) or os.getenv('TICKTICK_REDIRECT_URI')
+    redirect_uri_info = classify_redirect_uri(redirect_uri)
 
     token_source = value_source(getattr(args, 'token_path', None), 'TICKTICK_TOKEN_PATH')
     state_source = value_source(getattr(args, 'state_path', None), 'TICKTICK_STATE_PATH')
@@ -1841,6 +1926,8 @@ def command_doctor(
         issues.append('Missing TICKTICK_CLIENT_SECRET or --client-secret.')
     if not redirect_uri:
         issues.append('Missing TICKTICK_REDIRECT_URI or --redirect-uri.')
+    elif redirect_uri_info['mode'] == 'invalid':
+        issues.append(f"Redirect URI is not a valid absolute URL: {redirect_uri}")
     if not token_path_info['parentWritable']:
         issues.append(f"Token directory is not writable: {token_path_info['parentPath']}")
     if not state_path_info['parentWritable']:
@@ -1862,10 +1949,21 @@ def command_doctor(
         recommendations.append(
             'Set TICKTICK_STATE_PATH explicitly if you want OAuth state files stored beside your persistent token path.'
         )
+    if not redirect_uri:
+        recommendations.append(
+            f'For headless cloud OAuth without a public callback, set TICKTICK_REDIRECT_URI to {DEFAULT_LOCALHOST_REDIRECT_URI} and register the same value in the Dida/TickTick developer console.'
+        )
+    elif redirect_uri_info['mode'] == 'localhost':
+        recommendations.append(
+            'Localhost redirect detected. Run auth-url on the cloud host, open authorization_url in a local browser, then copy the full localhost callback URL from the address bar into auth-exchange.'
+        )
     if token_info['exists'] and token_info['valid'] and token_info['needsRefresh']:
         recommendations.append('Token is near expiry. Run token-status --auto-refresh or re-authenticate if refresh fails.')
     if not token_info['exists'] and client_id and client_secret and redirect_uri:
-        recommendations.append('Credential variables are present. Next step: run auth-url, approve access, then run auth-exchange.')
+        if redirect_uri_info['mode'] == 'localhost':
+            recommendations.append('Credential variables are present. Next step: run auth-url, approve access in a local browser, copy the full localhost callback URL, then run auth-exchange.')
+        else:
+            recommendations.append('Credential variables are present. Next step: run auth-url, approve access, then run auth-exchange.')
 
     api_check: dict[str, Any] | None = None
     if args.check_api:
@@ -1894,6 +1992,8 @@ def command_doctor(
                 'clientSecretSource': value_source(getattr(args, 'client_secret', None), 'TICKTICK_CLIENT_SECRET'),
                 'redirectUriPresent': bool(redirect_uri),
                 'redirectUriSource': value_source(getattr(args, 'redirect_uri', None), 'TICKTICK_REDIRECT_URI'),
+                'redirectUri': redirect_uri,
+                'redirectUriAnalysis': redirect_uri_info,
             },
             'paths': {
                 'token': token_path_info,
@@ -2974,7 +3074,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-path", help="Path to oauth state JSON file")
     parser.add_argument("--client-id", help="OAuth client id")
     parser.add_argument("--client-secret", help="OAuth client secret")
-    parser.add_argument("--redirect-uri", help="OAuth redirect URI")
+    parser.add_argument("--redirect-uri", help=f"OAuth redirect URI; headless cloud recommendation: {DEFAULT_LOCALHOST_REDIRECT_URI}")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 

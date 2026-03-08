@@ -48,7 +48,7 @@ Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the b
 1. Set environment variables in your cloud runtime:
    - `TICKTICK_CLIENT_ID`
    - `TICKTICK_CLIENT_SECRET`
-   - `TICKTICK_REDIRECT_URI`
+   - `TICKTICK_REDIRECT_URI` (recommended for headless cloud OAuth: `http://localhost:8080/callback`)
    - Optional: `TICKTICK_REGION` (`dida` default, or `ticktick`)
    - Recommended for persistent cloud storage: `TICKTICK_TOKEN_PATH`
    - Recommended for persistent cloud storage: `TICKTICK_STATE_PATH`
@@ -60,16 +60,17 @@ Run Dida365/TickTick task management from a cloud OpenClaw deployment. Use the b
    ```bash
    python {baseDir}/scripts/ticktick_openclaw.py auth-url
    ```
-4. Open that URL locally, approve access, and copy the full callback URL.
-5. Exchange callback URL for token:
+4. Open that URL in a local browser, approve access, and let the browser redirect to `http://localhost:8080/callback?code=...&state=...`.
+5. If the browser says localhost is unreachable, copy the full callback URL from the address bar anyway.
+6. Exchange callback URL for token on the cloud host:
    ```bash
-   python {baseDir}/scripts/ticktick_openclaw.py auth-exchange --callback-url "https://your.redirect/callback?code=...&state=..."
+   python {baseDir}/scripts/ticktick_openclaw.py auth-exchange --callback-url "http://localhost:8080/callback?code=...&state=..."
    ```
-6. Verify token status:
+7. Verify token status:
    ```bash
    python {baseDir}/scripts/ticktick_openclaw.py token-status --auto-refresh
    ```
-7. Start task management:
+8. Start task management:
    ```bash
    python {baseDir}/scripts/ticktick_openclaw.py projects
    python {baseDir}/scripts/ticktick_openclaw.py task-create --title "Prepare weekly report" --project-name "Work" --priority 3
@@ -153,7 +154,8 @@ python {baseDir}/scripts/ticktick_openclaw.py subtask-smart-delete --parent-task
 3. If callback exchange fails with state mismatch, regenerate URL via `auth-url`.
 4. If refresh fails, re-run `auth-url` + `auth-exchange`.
 5. `doctor` is a local deployment diagnostic and does not call vendor APIs unless `--check-api` is requested.
-6. `task-search`, `tasks-due`, `tasks-focus`, `schedule-analyze`, `schedule-rebalance`, `tasks-batch-create`, and all `*-smart-*` commands are convenience wrappers over the official endpoints already documented in `references/openapi-cheatsheet.md`.
+6. For cloud deployments without a public callback, prefer `TICKTICK_REDIRECT_URI=http://localhost:8080/callback`; after approval, copy the full localhost callback URL from the browser into `auth-exchange`.
+7. `task-search`, `tasks-due`, `tasks-focus`, `schedule-analyze`, `schedule-rebalance`, `tasks-batch-create`, and all `*-smart-*` commands are convenience wrappers over the official endpoints already documented in `references/openapi-cheatsheet.md`.
 
 ## References
 

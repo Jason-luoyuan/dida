@@ -61,13 +61,19 @@
 - `TICKTICK_TOKEN_PATH`（强烈建议，指向持久化目录）
 - `TICKTICK_STATE_PATH`（强烈建议，指向持久化目录）
 
+如果你的域名没有公网回调能力，推荐直接使用：
+
+- `http://localhost:8080/callback`
+
+它不要求 OpenClaw 暴露公网回调接口；浏览器跳转到这个地址后，即使页面报错，你仍然可以从地址栏复制完整回调 URL 完成换 token。
+
 示例：
 
 ```env
 TICKTICK_REGION=dida
 TICKTICK_CLIENT_ID=your_client_id
 TICKTICK_CLIENT_SECRET=your_client_secret
-TICKTICK_REDIRECT_URI=https://your-domain.example.com/ticktick/callback
+TICKTICK_REDIRECT_URI=http://localhost:8080/callback
 TICKTICK_TOKEN_PATH=/home/ubuntu/.openclaw/data/ticktick-openclaw-cloud/token.json
 TICKTICK_STATE_PATH=/home/ubuntu/.openclaw/data/ticktick-openclaw-cloud/oauth_state.json
 ```
@@ -127,14 +133,15 @@ python /home/ubuntu/.openclaw/workspace/skills/ticktick-openclaw-cloud/scripts/t
 ```
 
 2. 在本地浏览器打开返回的 `authorization_url`
-3. 授权后复制完整回调 URL
-4. 交换 token：
+3. 授权后浏览器会跳到 `http://localhost:8080/callback?code=...&state=...`
+4. 即使浏览器提示无法连接到 localhost，也直接复制地址栏里的完整回调 URL
+5. 在云端服务器上交换 token：
 
 ```bash
-python /home/ubuntu/.openclaw/workspace/skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py auth-exchange --callback-url "https://your-domain.example.com/ticktick/callback?code=...&state=..."
+python /home/ubuntu/.openclaw/workspace/skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py auth-exchange --callback-url "http://localhost:8080/callback?code=...&state=..."
 ```
 
-5. 检查 token：
+6. 检查 token：
 
 ```bash
 python /home/ubuntu/.openclaw/workspace/skills/ticktick-openclaw-cloud/scripts/ticktick_openclaw.py token-status --auto-refresh
@@ -154,5 +161,7 @@ python /home/ubuntu/.openclaw/workspace/skills/ticktick-openclaw-cloud/scripts/t
 
 - 默认 token 路径是运行用户 home 目录下的 `~/.openclaw/credentials/ticktick-openclaw-cloud/token.json`
 - 在云端部署里，仍然建议显式设置 `TICKTICK_TOKEN_PATH` 和 `TICKTICK_STATE_PATH`
+- `TICKTICK_REDIRECT_URI` 推荐固定成 `http://localhost:8080/callback`，并在开发者后台配置同样的值
+- 这个 localhost 回调只负责把 `code` 和 `state` 带回浏览器地址栏，不要求你的 OpenClaw 真的监听 `8080` 端口
 - 如果你的机器是持久化磁盘，重启后 token 文件会保留
 - 如果以后迁移到新的容器或新的实例，记得一起迁移持久化目录

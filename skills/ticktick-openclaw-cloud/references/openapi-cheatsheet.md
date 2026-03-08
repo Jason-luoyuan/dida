@@ -28,6 +28,11 @@ Token refresh endpoint:
 - `grant_type=refresh_token`
 - `refresh_token`
 
+Cloud OpenClaw note:
+- Official OAuth only requires the registered `redirect_uri` to match during authorize + token exchange.
+- For headless cloud deployments without a public callback route, this skill recommends `http://localhost:8080/callback`.
+- After approval, the browser may fail to load that localhost page; copy the full callback URL from the address bar and pass it to `auth-exchange`.
+
 ## Project Endpoints
 
 - `GET /project`
